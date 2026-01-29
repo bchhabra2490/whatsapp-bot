@@ -37,7 +37,7 @@ def webhook():
         # Get incoming message data
         incoming_message = request.form.get("Body", "")
         print(f"Incoming message: {incoming_message}")
-        # Twilio sends media as MediaUrl0, MediaUrl1, etc.
+        # Twilio sends media as MediaUrl0, MediaUrl1, etc. and MediaContentType0 for the first.
         media_urls = [
             url
             for url in [
@@ -47,7 +47,8 @@ def webhook():
             ]
             if url
         ]
-        print(f"Media URLs: {media_urls}")
+        media_content_type0 = (request.form.get("MediaContentType0") or "").strip().lower()
+        print(f"Media URLs: {media_urls}, MediaContentType0: {media_content_type0}")
         from_number = request.form.get("From", "")
         print(f"From number: {from_number}")
         message_sid = request.form.get("MessageSid", "")
@@ -56,16 +57,20 @@ def webhook():
         # Create Twilio response
         resp = MessagingResponse()
 
-        # Build a background job and enqueue it
+        # Build a background job and enqueue it (media = image/PDF, audio = voice note for Whisper)
         job_type = "media" if media_urls else "text"
         payload: dict = {}
         if media_urls:
-            payload = {"media_urls": media_urls, "incoming_text": incoming_message}
+            if media_content_type0.startswith("audio/"):
+                job_type = "audio"
+                payload = {"media_urls": media_urls}
+            else:
+                payload = {"media_urls": media_urls, "incoming_text": incoming_message}
         elif incoming_message:
             payload = {"text": incoming_message}
 
         if not payload:
-            resp.message("Please send a receipt image or PDF, or ask a question about your receipts.")
+            resp.message("Please send an image, PDF, voice note, or text message.")
             return str(resp), 200
 
         # Persist the incoming message immediately

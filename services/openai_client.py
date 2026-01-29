@@ -1,7 +1,8 @@
 """
-OpenAI client using the official `openai` package for embeddings + chat (with tools).
+OpenAI client using the official `openai` package for embeddings, chat (with tools), and Whisper transcription.
 """
 
+import io
 import json
 import os
 from typing import Any, Dict, List, Optional
@@ -17,8 +18,26 @@ class OpenAIClient:
 
         self.client = OpenAI(api_key=api_key, base_url=os.getenv("OPENAI_BASE_URL") or None)
         # Defaults can be overridden via env
-        self.chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-5")
+        self.chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
         self.embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+        self.whisper_model = os.getenv("OPENAI_WHISPER_MODEL", "whisper-1")
+
+    def transcribe_audio(self, audio_bytes: bytes, filename: str = "audio.ogg") -> str:
+        """
+        Transcribe audio using OpenAI Whisper. Returns transcribed text.
+        """
+        if not audio_bytes:
+            return ""
+        print(f"[OpenAIClient] transcribe_audio: size={len(audio_bytes)}, filename={filename}")
+        file_like = io.BytesIO(audio_bytes)
+        file_like.name = filename
+        resp = self.client.audio.transcriptions.create(
+            model=self.whisper_model,
+            file=file_like,
+        )
+        text = (resp.text or "").strip()
+        print(f"[OpenAIClient] transcribe_audio: got {len(text)} chars")
+        return text
 
     def create_embedding(self, text: str) -> List[float]:
         text = (text or "").strip()

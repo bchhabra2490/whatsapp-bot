@@ -6,6 +6,7 @@ here to make sure SUPABASE_*, TWILIO_*, OPENAI_* etc. are available.
 """
 
 import os
+import requests
 from typing import Any, Dict
 
 from celery import Celery
@@ -52,7 +53,7 @@ def _build_services():
 
     twilio_client = TwilioClient(twilio_account_sid, twilio_auth_token)
 
-    return supabase, handler, twilio_client, twilio_from
+    return supabase, handler, openai_client, twilio_client, twilio_from
 
 
 @celery_app.task(name="process_whatsapp_job")
@@ -60,7 +61,7 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
     """
     Background job: process a WhatsApp message (media or text) and send a reply.
     """
-    supabase, handler, twilio_client, twilio_from = _build_services()
+    supabase, handler, openai_client, twilio_client, twilio_from = _build_services()
 
     # Load job
     job = supabase.get_job(job_id)
@@ -81,6 +82,34 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
             response_text = handler.handle_media(
                 media_urls=media_urls, from_number=phone_number, message_sid=message_sid
             )
+        elif job_type == "audio":
+            print(f"[tasks.py] Processing audio job: {job_id} for {phone_number}")
+            media_urls = payload.get("media_urls") or []
+            if not media_urls:
+                response_text = "No audio received."
+                print(f"[tasks.py] No audio received.")
+            else:
+                # Download first audio and transcribe with OpenAI Whisper
+                audio_url = media_urls[0]
+                print(f"[tasks.py] Downloading audio: {audio_url}")
+                r = requests.get(audio_url, timeout=30)
+                r.raise_for_status()
+                audio_bytes = r.content
+                # Infer filename from URL or content-type (Whisper accepts common formats)
+                content_type = r.headers.get("Content-Type", "audio/ogg").split(";")[0].strip().lower()
+                ext = (
+                    "ogg"
+                    if "ogg" in content_type
+                    else "m4a" if "m4a" in content_type or "mp4" in content_type else "mp3"
+                )
+                filename = f"audio.{ext}"
+                transcribed = openai_client.transcribe_audio(audio_bytes, filename=filename)
+                if not transcribed:
+                    response_text = "I couldn't transcribe the audio. Please try again or send a text message."
+                else:
+                    response_text = handler.handle_text(
+                        message=transcribed, from_number=phone_number, message_sid=message_sid
+                    )
         elif job_type == "text":
             text = payload.get("text") or ""
             response_text = handler.handle_text(message=text, from_number=phone_number, message_sid=message_sid)
