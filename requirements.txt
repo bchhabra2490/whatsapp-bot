@@ -1,0 +1,10 @@
+Flask==3.0.0
+python-dotenv==1.0.0
+requests==2.31.0
+supabase==2.3.0
+twilio==9.0.0
+pdf2image==1.16.3
+openai>=1.55.0
+celery[redis]>=5.4.0
+httpcore>=1.0.8
+httpx>=0.27.0
