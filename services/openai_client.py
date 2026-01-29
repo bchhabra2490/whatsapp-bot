@@ -17,7 +17,7 @@ class OpenAIClient:
 
         self.client = OpenAI(api_key=api_key, base_url=os.getenv("OPENAI_BASE_URL") or None)
         # Defaults can be overridden via env
-        self.chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+        self.chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-5")
         self.embedding_model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
     def create_embedding(self, text: str) -> List[float]:
@@ -52,15 +52,15 @@ class OpenAIClient:
         kwargs: Dict[str, Any] = {
             "model": self.chat_model,
             "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
         }
+        print(f"[OpenAIClient] _chat_raw: kwargs: {kwargs}")
         if tools is not None:
             kwargs["tools"] = tools
         if tool_choice is not None:
             kwargs["tool_choice"] = tool_choice
 
         resp = self.client.chat.completions.create(**kwargs)
+        print(f"[OpenAIClient] _chat_raw: response: {resp}")
         choice = resp.choices[0]
         print("[OpenAIClient] _chat_raw: completion received")
         # `choice.message` is an object; we convert to a dict-like for downstream code.

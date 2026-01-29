@@ -72,6 +72,7 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
     job_type = job.get("job_type")
     payload = job.get("payload") or {}
 
+    print(f"[tasks.py] Processing job: {job_id} for {phone_number} with type {job_type}")
     try:
         supabase.update_job(job_id, {"status": "processing"})
 
