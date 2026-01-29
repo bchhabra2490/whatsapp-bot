@@ -102,6 +102,17 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
             body=response_text,
         )
 
+        ## Save the response to the database
+        supabase.save_message(
+            {
+                "phone_number": phone_number,
+                "direction": "out",
+                "role": "assistant",
+                "message_sid": message_sid,
+                "content": response_text,
+            }
+        )
+
         return {"success": True, "job_id": job_id}
     except Exception as e:
         supabase.update_job(job_id, {"status": "failed", "error": str(e)})
