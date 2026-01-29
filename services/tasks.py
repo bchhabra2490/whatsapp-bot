@@ -75,18 +75,16 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
     try:
         supabase.update_job(job_id, {"status": "processing"})
 
-        response_text = "Hello, this is a test response from the WhatsApp bot."
-
-        # if job_type == "media":
-        #     media_urls = payload.get("media_urls") or []
-        #     response_text = handler.handle_media(
-        #         media_urls=media_urls, from_number=phone_number, message_sid=message_sid
-        #     )
-        # elif job_type == "text":
-        #     text = payload.get("text") or ""
-        #     response_text = handler.handle_text(message=text, from_number=phone_number, message_sid=message_sid)
-        # else:
-        #     raise ValueError(f"Unsupported job_type: {job_type}")
+        if job_type == "media":
+            media_urls = payload.get("media_urls") or []
+            response_text = handler.handle_media(
+                media_urls=media_urls, from_number=phone_number, message_sid=message_sid
+            )
+        elif job_type == "text":
+            text = payload.get("text") or ""
+            response_text = handler.handle_text(message=text, from_number=phone_number, message_sid=message_sid)
+        else:
+            raise ValueError(f"Unsupported job_type: {job_type}")
 
         # Update job result
         supabase.update_job(job_id, {"status": "completed", "result": {"response": response_text}})
@@ -95,6 +93,7 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
         to_number = (phone_number or "").strip()
         if not to_number.lower().startswith("whatsapp:"):
             to_number = f"whatsapp:{to_number}" if to_number.startswith("+") else f"whatsapp:+{to_number}"
+
         print(f"[tasks.py] Sending WhatsApp reply to {to_number} from {twilio_from}")
         twilio_client.messages.create(
             from_=twilio_from,

@@ -128,7 +128,9 @@ class RecordProcessor:
             return "save_record"
         return "question"
 
-    def answer_question(self, phone_number: str, question: str, history: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
+    def answer_question(
+        self, phone_number: str, question: str, history: List[Dict[str, Any]] | None = None
+    ) -> Dict[str, Any]:
         try:
             print(f"[RecordProcessor] answer_question for {phone_number}: '{question[:120]}'")
             tools = [
