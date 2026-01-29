@@ -12,4 +12,3 @@ ENV/
 .DS_Store
 *.db
 *.sqlite
-.vscode
