@@ -110,6 +110,20 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
                     response_text = handler.handle_text(
                         message=transcribed, from_number=phone_number, message_sid=message_sid
                     )
+        elif job_type == "location":
+            lat = payload.get("latitude") or ""
+            lon = payload.get("longitude") or ""
+            address = payload.get("address") or ""
+            label = payload.get("label") or ""
+            parts = [f"Location: {lat}, {lon}"]
+            if label:
+                parts.append(f"Label: {label}")
+            if address:
+                parts.append(f"Address: {address}")
+            location_text = "\n".join(parts)
+            response_text = handler.handle_text(
+                message=location_text, from_number=phone_number, message_sid=message_sid
+            )
         elif job_type == "text":
             text = payload.get("text") or ""
             response_text = handler.handle_text(message=text, from_number=phone_number, message_sid=message_sid)

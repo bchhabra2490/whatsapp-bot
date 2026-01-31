@@ -48,7 +48,13 @@ def webhook():
             if url
         ]
         media_content_type0 = (request.form.get("MediaContentType0") or "").strip().lower()
-        print(f"Media URLs: {media_urls}, MediaContentType0: {media_content_type0}")
+        # Twilio sends Latitude, Longitude, Address, Label for shared location
+        latitude = request.form.get("Latitude", "").strip()
+        longitude = request.form.get("Longitude", "").strip()
+        address = (request.form.get("Address") or "").strip()
+        label = (request.form.get("Label") or "").strip()
+        has_location = latitude and longitude
+        print(f"Media URLs: {media_urls}, MediaContentType0: {media_content_type0}, Location: {latitude},{longitude}")
         from_number = request.form.get("From", "")
         print(f"From number: {from_number}")
         message_sid = request.form.get("MessageSid", "")
@@ -57,20 +63,29 @@ def webhook():
         # Create Twilio response
         resp = MessagingResponse()
 
-        # Build a background job and enqueue it (media = image/PDF, audio = voice note for Whisper)
-        job_type = "media" if media_urls else "text"
+        # Build a background job (location | media | audio | text)
+        job_type = "text"
         payload: dict = {}
-        if media_urls:
+        if has_location:
+            job_type = "location"
+            payload = {
+                "latitude": latitude,
+                "longitude": longitude,
+                "address": address or None,
+                "label": label or None,
+            }
+        elif media_urls:
             if media_content_type0.startswith("audio/"):
                 job_type = "audio"
                 payload = {"media_urls": media_urls}
             else:
+                job_type = "media"
                 payload = {"media_urls": media_urls, "incoming_text": incoming_message}
         elif incoming_message:
             payload = {"text": incoming_message}
 
         if not payload:
-            resp.message("Please send an image, PDF, voice note, or text message.")
+            resp.message("Please send an image, PDF, voice note, location, or text message.")
             return str(resp), 200
 
         # Persist the incoming message immediately
@@ -81,8 +96,17 @@ def webhook():
                     "direction": "in",
                     "role": "user",
                     "message_sid": message_sid,
-                    "content": incoming_message or (f"[media] {', '.join(media_urls)}" if media_urls else ""),
-                    "metadata": {"media_urls": media_urls} if media_urls else {},
+                    "content": incoming_message
+                    or (
+                        f"[location] {latitude},{longitude}"
+                        if has_location
+                        else (f"[media] {', '.join(media_urls)}" if media_urls else "")
+                    ),
+                    "metadata": (
+                        {"media_urls": media_urls}
+                        if media_urls
+                        else ({"latitude": latitude, "longitude": longitude} if has_location else {})
+                    ),
                 }
             )
         except Exception as e:
