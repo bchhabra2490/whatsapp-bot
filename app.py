@@ -1,8 +1,3 @@
-"""
-WhatsApp Receipt Capture Bot
-Main Flask application entry point
-"""
-
 import os
 import logging
 from flask import Flask, request, jsonify
@@ -37,7 +32,6 @@ def webhook():
         # Get incoming message data
         incoming_message = request.form.get("Body", "")
         print(f"Incoming message: {incoming_message}")
-        # Twilio sends media as MediaUrl0, MediaUrl1, etc. and MediaContentType0 for the first.
         media_urls = [
             url
             for url in [
@@ -48,7 +42,6 @@ def webhook():
             if url
         ]
         media_content_type0 = (request.form.get("MediaContentType0") or "").strip().lower()
-        # Twilio sends Latitude, Longitude, Address, Label for shared location
         latitude = request.form.get("Latitude", "").strip()
         longitude = request.form.get("Longitude", "").strip()
         address = (request.form.get("Address") or "").strip()
@@ -105,7 +98,7 @@ def webhook():
                     "metadata": (
                         {"media_urls": media_urls}
                         if media_urls
-                        else ({"latitude": latitude, "longitude": longitude} if has_location else {})
+                        else ("{\"latitude\": \"" + latitude + "\", \"longitude\": \"" + longitude + "\"}" if has_location else {})
                     ),
                 }
             )
@@ -122,10 +115,15 @@ def webhook():
             }
         )
 
+        # Respond with bill and receipt images if requested
+        if "bill" in incoming_message.lower() or "receipt" in incoming_message.lower():
+            resp.message("Here are your bill and receipt images:")
+            resp.message("[link to bill image]")
+            resp.message("[link to receipt image]")
+
         # Enqueue Celery task
         try:
             process_whatsapp_job.delay(str(job.get("id")))
-            # resp.message("✅ Got your message. I'm processing it in the background and will reply shortly.")
         except Exception as e:
             logger.error(f"Failed to enqueue background job: {e}", exc_info=True)
             resp.message("❌ Sorry, I couldn't start processing your message. Please try again later.")
