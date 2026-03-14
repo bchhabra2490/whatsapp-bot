@@ -99,3 +99,7 @@ class MistralOCR:
             raise Exception(f"Mistral API error: {str(e)}")
         except (KeyError, IndexError) as e:
             raise Exception(f"Unexpected API response format: {str(e)}")
+
+    def image_response(self, image_url: str) -> str:
+        # Dummy image response for demonstration
+        return f"Image response for {image_url}"
