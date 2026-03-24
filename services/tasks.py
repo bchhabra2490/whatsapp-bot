@@ -18,6 +18,7 @@ from services.mistral_ocr import MistralOCR
 from services.openai_client import OpenAIClient
 from services.receipt_processor import RecordProcessor
 from services.whatsapp_handler import WhatsAppHandler
+from services.call_service import CallService
 
 
 def make_celery() -> Celery:
@@ -39,7 +40,6 @@ def _build_services():
     mistral = MistralOCR()
     openai_client = OpenAIClient()
     processor = RecordProcessor(supabase, mistral, openai_client)
-    handler = WhatsAppHandler(processor)
 
     twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
@@ -52,6 +52,8 @@ def _build_services():
         twilio_from = f"whatsapp:{raw}" if raw.startswith("+") else f"whatsapp:+{raw}"
 
     twilio_client = TwilioClient(twilio_account_sid, twilio_auth_token)
+    call_service = CallService(twilio_client=twilio_client, openai_client=openai_client)
+    handler = WhatsAppHandler(processor, call_service=call_service)
 
     return supabase, handler, openai_client, twilio_client, twilio_from
 

@@ -5,13 +5,15 @@ WhatsApp message handler
 from typing import List
 
 from services.receipt_processor import RecordProcessor
+from services.call_service import CallService
 
 
 class WhatsAppHandler:
     """Handles incoming WhatsApp messages"""
 
-    def __init__(self, record_processor: RecordProcessor):
+    def __init__(self, record_processor: RecordProcessor, call_service: CallService | None = None):
         self.processor = record_processor
+        self.call_service = call_service
 
     def handle_media(self, media_urls: List[str], from_number: str, message_sid: str) -> str:
         """
@@ -67,6 +69,29 @@ class WhatsAppHandler:
             if saved.get("success"):
                 return f"✅ Saved your note.\nRecord ID: {saved.get('record_id')}"
             return f"❌ Failed to save your note: {saved.get('error')}"
+
+        if intent == "call":
+            if not self.call_service:
+                return "❌ Calling is not configured yet."
+
+            extracted = self.processor.extract_call_request(message=message)
+            target_number = extracted.get("target_number") or ""
+            question_to_ask = extracted.get("question_to_ask") or ""
+            if not target_number or not question_to_ask:
+                return (
+                    "❌ I couldn't parse the call details.\n"
+                    "Try: call +1234567890 and ask if they can share the shipment ETA."
+                )
+
+            started = self.call_service.start_outbound_call(
+                requested_by=from_number,
+                to_number=target_number,
+                prompt_question=question_to_ask,
+            )
+            print(f"[WhatsAppHandler] start_outbound_call result: {started}")
+            if started.get("success"):
+                return f"📞 Calling {started.get('to_number')} now.\n" f'I\'ll ask: "{question_to_ask}"'
+            return f"❌ Failed to start call: {started.get('error')}"
 
         answered = self.processor.answer_question(phone_number=from_number, question=message, history=history)
         print(f"[WhatsAppHandler] answer_question result: {answered}")

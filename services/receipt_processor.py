@@ -6,6 +6,7 @@ Record processing pipeline:
 """
 
 import requests
+import json
 from typing import Dict, Any, List
 
 from services.supabase_client import SupabaseClient
@@ -98,7 +99,7 @@ class RecordProcessor:
 
     def detect_intent(self, message: str, history: List[Dict[str, Any]] | None = None) -> str:
         """
-        Returns: 'question' | 'save_record'
+        Returns: 'question' | 'save_record' | 'call'
         """
         # Build short conversation context from recent messages if provided
         history_text = ""
@@ -115,7 +116,8 @@ class RecordProcessor:
         system = (
             "You classify user WhatsApp messages for a personal capture bot.\n"
             "You will be given the recent conversation and the latest user message.\n"
-            "Return exactly one token: question OR save_record.\n"
+            "Return exactly one token: question OR save_record OR call.\n"
+            "- If the user asks to call someone, phone someone, place a call, or dial a number: call.\n"
             "- If the user asks anything, requests info, or wants to find something: question.\n"
             "- If the user is stating something to remember, logging info, or saving a note: save_record.\n"
         )
@@ -124,9 +126,37 @@ class RecordProcessor:
         print(f"[RecordProcessor] detect_intent: message='{message[:80]}'")
         out = self.openai.chat(system=system, user=user, temperature=0.0, max_tokens=5).lower()
         print(f"[RecordProcessor] detect_intent raw output: '{out}'")
+        if "call" in out:
+            return "call"
         if "save_record" in out:
             return "save_record"
         return "question"
+
+    def extract_call_request(self, message: str) -> Dict[str, str]:
+        """
+        Parse a free-form call request into:
+          - target_number
+          - question_to_ask
+        """
+
+        system = (
+            "Extract phone call instructions from a WhatsApp message.\n"
+            "Return strict JSON with keys: target_number, question_to_ask.\n"
+            "Rules:\n"
+            "- target_number: keep phone digits with optional leading + only.\n"
+            "- question_to_ask: what should be asked on the call.\n"
+            "- If either value is unclear, use empty string."
+        )
+        user = f"Latest user message:\n{message}"
+        raw = self.openai.chat(system=system, user=user, temperature=0.0, max_tokens=120)
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = {}
+        return {
+            "target_number": str(parsed.get("target_number") or "").strip(),
+            "question_to_ask": str(parsed.get("question_to_ask") or "").strip(),
+        }
 
     def answer_question(
         self, phone_number: str, question: str, history: List[Dict[str, Any]] | None = None
