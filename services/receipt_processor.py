@@ -7,6 +7,7 @@ Record processing pipeline:
 
 import requests
 import json
+from datetime import datetime
 from typing import Dict, Any, List
 
 from services.supabase_client import SupabaseClient
@@ -139,12 +140,27 @@ class RecordProcessor:
           - question_to_ask
         """
 
+        hour = datetime.now().hour
+        if 5 <= hour < 12:
+            greeting = "Good morning"
+        elif 12 <= hour < 17:
+            greeting = "Good afternoon"
+        elif 17 <= hour < 22:
+            greeting = "Good evening"
+        else:
+            greeting = "Hello"
+
         system = (
             "Extract phone call instructions from a WhatsApp message.\n"
-            "Return strict JSON with keys: target_number, question_to_ask.\n"
+            "Return STRICT JSON with keys: target_number, question_to_ask.\n"
+            "\n"
             "Rules:\n"
             "- target_number: keep phone digits with optional leading + only.\n"
-            "- question_to_ask: what should be asked on the call.\n"
+            "- question_to_ask: MUST be a natural spoken script for the call (not a command).\n"
+            f"- Start with a brief greeting based on time of day: '{greeting}'.\n"
+            "- Include a polite opener and a clear question.\n"
+            "- Add ellipses '...' for short pauses (at least 1-2 places).\n"
+            "- Keep it short (1-2 sentences).\n"
             "- If either value is unclear, use empty string."
         )
         user = f"Latest user message:\n{message}"

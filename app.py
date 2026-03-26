@@ -9,8 +9,8 @@ from urllib.parse import urlencode
 from flask import Flask, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.twiml.voice_response import VoiceResponse
 from twilio.rest import Client as TwilioClient
+from xml.sax.saxutils import escape
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -156,26 +156,29 @@ def voice_call():
     call_id = (request.args.get("call_id") or "").strip()
     prompt_from_query = (request.args.get("prompt_question") or "").strip()
     context = call_service.get_call_context(call_id) if call_id else None
+    print(f"Context: {context}")
 
-    vr = VoiceResponse()
     if not context and not prompt_from_query:
-        vr.say("Sorry, the call session could not be found. Goodbye.")
-        vr.hangup()
-        return str(vr), 200, {"Content-Type": "application/xml"}
+        # Return valid TwiML even on error.
+        xml = "<Response><Hangup/></Response>"
+        return xml, 200, {"Content-Type": "application/xml"}
 
     prompt = prompt_from_query or context.get("prompt_question") or "I have a quick question for you."
-    vr.say(f"Hello. This is an automated assistant call. {prompt}")
+    # Avoid Twilio <Say> (robotic). Use ElevenLabs audio + <Play>.
+    prompt_tts = call_service.synthesize_for_call(call_id=call_id, text=prompt, tag="prompt")
+    if not prompt_tts.get("success"):
+        xml = "<Response><Hangup/></Response>"
+        return xml, 200, {"Content-Type": "application/xml"}
+
     action_query = urlencode({"call_id": call_id, "prompt_question": prompt})
-    vr.record(
-        max_length=20,
-        play_beep=True,
-        action=f"/voice/recording-complete?{action_query}",
-        method="POST",
-        timeout=4,
+    record_action = f"{call_service.base_url}/voice/recording-complete?{action_query}"
+    xml = (
+        "<Response>"
+        f"<Play>{escape(prompt_tts.get('audio_url') or '')}</Play>"
+        f'<Record maxLength="20" playBeep="true" timeout="4" method="POST" action="{escape(record_action)}"/>'
+        "</Response>"
     )
-    vr.say("No recording was received. Goodbye.")
-    vr.hangup()
-    return str(vr), 200, {"Content-Type": "application/xml"}
+    return xml, 200, {"Content-Type": "application/xml"}
 
 
 @app.route("/voice/recording-complete", methods=["POST"])
@@ -187,33 +190,51 @@ def voice_recording_complete():
     call_id = (request.args.get("call_id") or "").strip()
     prompt_question = (request.args.get("prompt_question") or "").strip()
     recording_url = (request.form.get("RecordingUrl") or "").strip()
-    vr = VoiceResponse()
+    print(f"Recording URL: {recording_url}")
+    print(f"Prompt Question: {prompt_question}")
+    print(f"Call ID: {call_id}")
     try:
         processed = call_service.process_recording(
             call_id=call_id,
             recording_url=recording_url,
             prompt_question=prompt_question,
         )
+        print(f"Processed: {processed}")
         if not processed.get("success"):
-            vr.say("Sorry, I could not process your response right now. Goodbye.")
-            vr.hangup()
-            return str(vr), 200, {"Content-Type": "application/xml"}
+            xml = "<Response><Hangup/></Response>"
+            return xml, 200, {"Content-Type": "application/xml"}
 
         audio_url = (processed.get("audio_url") or "").strip()
+        print(f"Audio URL: {audio_url}")
+        hangup = bool(processed.get("hangup"))
+        followup_prompt = (processed.get("followup_prompt") or "").strip()
+
+        # Play LLM response via ElevenLabs
+        parts = ["<Response>"]
         if audio_url:
-            vr.play(audio_url)
-        else:
-            if processed.get("tts_error"):
-                logger.error(f"ElevenLabs TTS failed, falling back to Twilio Say: {processed.get('tts_error')}")
-            vr.say(processed.get("llm_response") or "Thank you for your response.")
-        vr.say("Thank you. Goodbye.")
-        vr.hangup()
-        return str(vr), 200, {"Content-Type": "application/xml"}
+            parts.append(f"<Play>{escape(audio_url)}</Play>")
+
+        if hangup:
+            parts.append("<Hangup/>")
+            parts.append("</Response>")
+            return "".join(parts), 200, {"Content-Type": "application/xml"}
+
+        # Not hanging up: ask a follow-up and record again (all via ElevenLabs audio)
+        followup_tts = call_service.synthesize_for_call(call_id=call_id, text=followup_prompt, tag="followup")
+        if followup_tts.get("success") and followup_tts.get("audio_url"):
+            parts.append(f"<Play>{escape(followup_tts.get('audio_url'))}</Play>")
+
+        next_query = urlencode({"call_id": call_id, "prompt_question": followup_prompt})
+        next_action = f"{call_service.base_url}/voice/recording-complete?{next_query}"
+        parts.append(
+            f'<Record maxLength="20" playBeep="true" timeout="4" method="POST" action="{escape(next_action)}"/>'
+        )
+        parts.append("</Response>")
+        return "".join(parts), 200, {"Content-Type": "application/xml"}
     except Exception as e:
         logger.error(f"Voice recording handler failed: {e}", exc_info=True)
-        vr.say("Sorry, something went wrong while processing this call. Goodbye.")
-        vr.hangup()
-        return str(vr), 200, {"Content-Type": "application/xml"}
+        xml = "<Response><Hangup/></Response>"
+        return xml, 200, {"Content-Type": "application/xml"}
 
 
 @app.route("/audio/<path:filename>", methods=["GET"])
