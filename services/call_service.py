@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 import requests
 from twilio.rest import Client as TwilioClient
 from elevenlabs.client import ElevenLabs
+import redis
 
 from services.openai_client import OpenAIClient
 
@@ -38,6 +39,47 @@ class CallService:
         self.elevenlabs_voice_id = (os.getenv("ELEVENLABS_VOICE_ID") or "").strip()
         self.audio_dir = Path(os.getenv("CALL_AUDIO_DIR") or "generated_audio")
         self.audio_dir.mkdir(parents=True, exist_ok=True)
+        self.redis_url = (
+            os.getenv("REDIS_URL") or os.getenv("CELERY_BROKER_URL") or "redis://localhost:6379/0"
+        ).strip()
+        self.call_state_ttl_seconds = int(os.getenv("CALL_STATE_TTL_SECONDS") or "86400")
+        self._redis_client: Optional[redis.Redis] = None
+
+    def _redis(self) -> redis.Redis:
+        if self._redis_client is None:
+            # decode_responses=False because we store raw JSON bytes
+            self._redis_client = redis.Redis.from_url(self.redis_url, decode_responses=False)
+        return self._redis_client
+
+    @staticmethod
+    def _state_key(call_id: str) -> str:
+        return f"wbot:call:{call_id}"
+
+    def _load_state(self, call_id: str) -> Dict[str, Any]:
+        try:
+            raw = self._redis().get(self._state_key(call_id))
+            if not raw:
+                return {}
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_state(self, call_id: str, state: Dict[str, Any]) -> None:
+        payload = json.dumps(state, ensure_ascii=False).encode("utf-8")
+        self._redis().setex(self._state_key(call_id), self.call_state_ttl_seconds, payload)
+
+    def update_state(self, call_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Merge updates into Redis state and persist.
+        Returns the merged state.
+        """
+        state = self._load_state(call_id) or {"call_id": call_id, "history": []}
+        state.update(updates or {})
+        self._save_state(call_id, state)
+        return state
 
     @staticmethod
     def _normalize_phone_number(raw: str) -> str:
@@ -66,6 +108,23 @@ class CallService:
                 "to_number": normalized_to,
                 "prompt_question": prompt_question,
             }
+        # Persist initial call state in Redis so voice webhooks (separate process) can retrieve it.
+        try:
+            self._save_state(
+                call_id,
+                {
+                    "call_id": call_id,
+                    "requested_by": requested_by,
+                    "to_number": normalized_to,
+                    "prompt_question": prompt_question,
+                    "history": [
+                        {"role": "assistant", "text": prompt_question},
+                    ],
+                },
+            )
+        except Exception:
+            # If Redis is unavailable, fall back to stateless query params + in-memory.
+            pass
 
         query = urlencode(
             {
@@ -84,6 +143,10 @@ class CallService:
         return {"success": True, "call_id": call_id, "call_sid": call.sid, "to_number": normalized_to}
 
     def get_call_context(self, call_id: str) -> Optional[Dict[str, Any]]:
+        # Prefer Redis state (works across processes); fall back to in-memory.
+        state = self._load_state(call_id) if call_id else {}
+        if state:
+            return state
         with self._lock:
             return self._pending_calls.get(call_id)
 
@@ -141,21 +204,44 @@ class CallService:
         self._synthesize_with_elevenlabs((text or "").strip(), output_path=output_path)
         return {"success": True, "audio_url": f"{self.base_url}/audio/{filename}", "filename": filename}
 
-    def process_recording(self, call_id: str, recording_url: str, prompt_question: str = "") -> Dict[str, Any]:
-        context = self.get_call_context(call_id)
-        prompt_to_use = (prompt_question or "").strip() or ((context or {}).get("prompt_question") or "").strip()
+    def process_transcript(self, call_id: str, transcript: str, prompt_question: str = "") -> Dict[str, Any]:
+        """
+        Process a transcript (from realtime Deepgram or fallback recording):
+        - append transcript to Redis history
+        - run LLM to produce {response_text, hangup, followup_prompt}
+        - synthesize ElevenLabs audio for response and followup (if needed)
+        - persist decision + audio URLs in Redis
+        """
+        context = self.get_call_context(call_id) or {}
+        prompt_to_use = (prompt_question or "").strip() or (str(context.get("prompt_question") or "").strip())
         if not prompt_to_use:
             return {"success": False, "error": "Unknown call context"}
 
-        if not recording_url:
-            return {"success": False, "error": "Missing recording URL"}
+        transcript = (transcript or "").strip() or "No speech recognized."
 
-        rec_resp = requests.get(f"{recording_url}.wav", timeout=60)
-        rec_resp.raise_for_status()
-        content_type = rec_resp.headers.get("Content-Type", "audio/wav")
-        transcript = self._transcribe_with_deepgram(rec_resp.content, content_type=content_type)
-        if not transcript:
-            transcript = "No speech recognized."
+        # Update Redis history with the user's turn
+        try:
+            state = self._load_state(call_id) or {
+                "call_id": call_id,
+                "prompt_question": prompt_to_use,
+                "history": [],
+            }
+            history = state.get("history") if isinstance(state.get("history"), list) else []
+            history.append({"role": "user", "text": transcript})
+            state["history"] = history
+            state["prompt_question"] = prompt_to_use
+            self._save_state(call_id, state)
+            context = state
+        except Exception:
+            pass
+
+        history_lines = []
+        for turn in (context.get("history") or [])[:60]:
+            role = turn.get("role") or "user"
+            text = (turn.get("text") or "").strip()
+            if text:
+                history_lines.append(f"{role}: {text}")
+        history_text = "\n".join(history_lines).strip() or "(none)"
 
         raw = self.openai.chat(
             system=(
@@ -165,12 +251,15 @@ class CallService:
                 "- hangup (boolean): true if the call should end now.\n"
                 "- followup_prompt (string): if NOT hanging up, what question to ask next.\n"
                 "Guidelines:\n"
-                "- Keep response_text concise and natural for speech.\n"
+                "- Keep response_text concise (ideally 1 short sentence).\n"
                 "- Only set hangup=true when the conversation is complete.\n"
             ),
-            user=(f"Current question asked: {prompt_to_use}\n" f"Callee response (transcript): {transcript}\n"),
+            user=(
+                f"Conversation so far:\n{history_text}\n\n"
+                f"Most recent callee response (transcript): {transcript}\n"
+            ),
             temperature=0.2,
-            max_tokens=220,
+            max_tokens=140,
         )
         try:
             parsed = json.loads(raw)
@@ -183,15 +272,68 @@ class CallService:
         if not hangup and not followup_prompt:
             followup_prompt = "Anything else you'd like to add?"
 
-        tts = self.synthesize_for_call(call_id=call_id, text=response_text, tag="response")
-        if not tts.get("success"):
-            return {"success": False, "error": tts.get("error") or "tts_failed"}
+        response_tts = self.synthesize_for_call(call_id=call_id, text=response_text, tag="response")
+        if not response_tts.get("success"):
+            return {"success": False, "error": response_tts.get("error") or "tts_failed"}
+
+        followup_audio_url = ""
+        if not hangup:
+            followup_tts = self.synthesize_for_call(call_id=call_id, text=followup_prompt, tag="followup")
+            if followup_tts.get("success"):
+                followup_audio_url = followup_tts.get("audio_url") or ""
+
+        # Persist assistant turn + decision so /voice/play can serve it
+        try:
+            state = self._load_state(call_id) or context or {"call_id": call_id, "history": []}
+            history = state.get("history") if isinstance(state.get("history"), list) else []
+            history.append({"role": "assistant", "text": response_text})
+            if not hangup:
+                history.append({"role": "assistant", "text": followup_prompt})
+            state.update(
+                {
+                    "history": history,
+                    "hangup": hangup,
+                    "response_text": response_text,
+                    "followup_prompt": followup_prompt,
+                    "response_audio_url": response_tts.get("audio_url"),
+                    "followup_audio_url": followup_audio_url,
+                    "prompt_question": followup_prompt if not hangup else prompt_to_use,
+                }
+            )
+            self._save_state(call_id, state)
+        except Exception:
+            pass
 
         return {
             "success": True,
             "transcript": transcript,
             "response_text": response_text,
-            "audio_url": tts.get("audio_url"),
             "hangup": hangup,
             "followup_prompt": followup_prompt,
+            "response_audio_url": response_tts.get("audio_url"),
+            "followup_audio_url": followup_audio_url,
         }
+
+    def process_recording(self, call_id: str, recording_url: str, prompt_question: str = "") -> Dict[str, Any]:
+        context = self.get_call_context(call_id) or {}
+        prompt_to_use = (prompt_question or "").strip() or (str(context.get("prompt_question") or "").strip())
+        if not prompt_to_use:
+            return {"success": False, "error": "Unknown call context"}
+
+        if not recording_url:
+            return {"success": False, "error": "Missing recording URL"}
+
+        # Prefer MP3 to reduce latency and payload size; fall back to WAV.
+        rec_resp = None
+        content_type = ""
+        try:
+            rec_resp = requests.get(f"{recording_url}.mp3", timeout=45)
+            rec_resp.raise_for_status()
+            content_type = rec_resp.headers.get("Content-Type", "audio/mpeg")
+        except Exception:
+            rec_resp = requests.get(f"{recording_url}.wav", timeout=60)
+            rec_resp.raise_for_status()
+            content_type = rec_resp.headers.get("Content-Type", "audio/wav")
+
+        transcript = self._transcribe_with_deepgram(rec_resp.content, content_type=content_type)
+        return self.process_transcript(call_id=call_id, transcript=transcript, prompt_question=prompt_to_use)

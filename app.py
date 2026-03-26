@@ -5,12 +5,17 @@ Main Flask application entry point
 
 import os
 import logging
+import base64
+import json
+import threading
 from urllib.parse import urlencode
 from flask import Flask, request, jsonify, send_from_directory
 from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 from xml.sax.saxutils import escape
+from flask_sock import Sock
+import websocket
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -24,6 +29,7 @@ from services.call_service import CallService
 load_dotenv()
 
 app = Flask(__name__)
+sock = Sock(app)
 
 # Initialize services
 supabase_client = SupabaseClient()
@@ -170,71 +176,223 @@ def voice_call():
         xml = "<Response><Hangup/></Response>"
         return xml, 200, {"Content-Type": "application/xml"}
 
-    action_query = urlencode({"call_id": call_id, "prompt_question": prompt})
-    record_action = f"{call_service.base_url}/voice/recording-complete?{action_query}"
+    # Keep prompt question in Redis so stream processing has the correct context.
+    try:
+        call_service.update_state(call_id, {"prompt_question": prompt})
+    except Exception:
+        pass
+
+    # Start Twilio Media Stream (realtime) to /voice/stream
+    ws_base = call_service.base_url.replace("https://", "wss://").replace("http://", "ws://")
+    stream_query = urlencode({"call_id": call_id})
+    stream_url = f"{ws_base}/voice/stream?{stream_query}"
     xml = (
         "<Response>"
         f"<Play>{escape(prompt_tts.get('audio_url') or '')}</Play>"
-        f'<Record maxLength="20" playBeep="true" timeout="4" method="POST" action="{escape(record_action)}"/>'
+        "<Start>"
+        f'<Stream url="{escape(stream_url)}" />'
+        "</Start>"
+        # Keep call alive while stream runs; call control will redirect to /voice/play when ready.
+        '<Pause length="600" />'
         "</Response>"
     )
     return xml, 200, {"Content-Type": "application/xml"}
 
 
-@app.route("/voice/recording-complete", methods=["POST"])
-def voice_recording_complete():
+@app.route("/voice/play", methods=["POST", "GET"])
+def voice_play():
     """
-    Receives Twilio recording callback, transcribes audio with Deepgram,
-    generates spoken reply with LLM + ElevenLabs, and plays it to callee.
+    TwiML endpoint used after a transcript is finalized.
+    Plays the latest response (and followup prompt if continuing), then either hangs up
+    or redirects back to /voice/stream-start to listen again.
     """
     call_id = (request.args.get("call_id") or "").strip()
-    prompt_question = (request.args.get("prompt_question") or "").strip()
-    recording_url = (request.form.get("RecordingUrl") or "").strip()
-    print(f"Recording URL: {recording_url}")
-    print(f"Prompt Question: {prompt_question}")
-    print(f"Call ID: {call_id}")
-    try:
-        processed = call_service.process_recording(
-            call_id=call_id,
-            recording_url=recording_url,
-            prompt_question=prompt_question,
-        )
-        print(f"Processed: {processed}")
-        if not processed.get("success"):
-            xml = "<Response><Hangup/></Response>"
-            return xml, 200, {"Content-Type": "application/xml"}
+    state = call_service.get_call_context(call_id) or {}
+    response_audio_url = (state.get("response_audio_url") or "").strip()
+    followup_audio_url = (state.get("followup_audio_url") or "").strip()
+    hangup = bool(state.get("hangup"))
 
-        audio_url = (processed.get("audio_url") or "").strip()
-        print(f"Audio URL: {audio_url}")
-        hangup = bool(processed.get("hangup"))
-        followup_prompt = (processed.get("followup_prompt") or "").strip()
+    parts = ["<Response>"]
+    if response_audio_url:
+        parts.append(f"<Play>{escape(response_audio_url)}</Play>")
+    if not hangup and followup_audio_url:
+        parts.append(f"<Play>{escape(followup_audio_url)}</Play>")
 
-        # Play LLM response via ElevenLabs
-        parts = ["<Response>"]
-        if audio_url:
-            parts.append(f"<Play>{escape(audio_url)}</Play>")
-
-        if hangup:
-            parts.append("<Hangup/>")
-            parts.append("</Response>")
-            return "".join(parts), 200, {"Content-Type": "application/xml"}
-
-        # Not hanging up: ask a follow-up and record again (all via ElevenLabs audio)
-        followup_tts = call_service.synthesize_for_call(call_id=call_id, text=followup_prompt, tag="followup")
-        if followup_tts.get("success") and followup_tts.get("audio_url"):
-            parts.append(f"<Play>{escape(followup_tts.get('audio_url'))}</Play>")
-
-        next_query = urlencode({"call_id": call_id, "prompt_question": followup_prompt})
-        next_action = f"{call_service.base_url}/voice/recording-complete?{next_query}"
-        parts.append(
-            f'<Record maxLength="20" playBeep="true" timeout="4" method="POST" action="{escape(next_action)}"/>'
-        )
+    if hangup:
+        parts.append("<Hangup/>")
         parts.append("</Response>")
         return "".join(parts), 200, {"Content-Type": "application/xml"}
+
+    # Resume streaming for next user response
+    redirect_url = f"{call_service.base_url}/voice/stream-start?{urlencode({'call_id': call_id})}"
+    parts.append(f'<Redirect method="POST">{escape(redirect_url)}</Redirect>')
+    parts.append("</Response>")
+    return "".join(parts), 200, {"Content-Type": "application/xml"}
+
+
+@app.route("/voice/stream-start", methods=["POST", "GET"])
+def voice_stream_start():
+    """
+    Starts / restarts Twilio Media Stream for the call.
+    """
+    call_id = (request.args.get("call_id") or "").strip()
+    ws_base = call_service.base_url.replace("https://", "wss://").replace("http://", "ws://")
+    stream_url = f"{ws_base}/voice/stream?{urlencode({'call_id': call_id})}"
+    xml = (
+        "<Response>"
+        "<Start>"
+        f'<Stream url="{escape(stream_url)}" />'
+        "</Start>"
+        '<Pause length="600" />'
+        "</Response>"
+    )
+    return xml, 200, {"Content-Type": "application/xml"}
+
+
+@sock.route("/voice/stream")
+def voice_stream(ws):
+    """
+    Twilio Media Stream WebSocket:
+    - Receives Twilio audio frames (mulaw/8khz) over websocket
+    - Forwards them to Deepgram realtime websocket
+    - On final transcript, runs LLM->ElevenLabs and redirects the live call to /voice/play
+    """
+    call_id = (request.args.get("call_id") or "").strip()
+    if not call_id:
+        return
+
+    deepgram_key = (os.getenv("DEEPGRAM_API_KEY") or "").strip()
+    if not deepgram_key:
+        logger.error("DEEPGRAM_API_KEY missing; cannot stream")
+        return
+
+    # Deepgram realtime expects raw audio bytes. Twilio sends base64 mulaw (8khz mono).
+    dg_url = (
+        "wss://api.deepgram.com/v1/listen"
+        "?encoding=mulaw&sample_rate=8000&channels=1"
+        "&model=nova-2&smart_format=true&punctuate=true"
+        "&interim_results=true&endpointing=200"
+    )
+
+    final_transcript = {"text": ""}
+    call_sid_box = {"sid": ""}
+    done = threading.Event()
+
+    def on_dg_message(_ws, message):
+        try:
+            data = json.loads(message)
+        except Exception:
+            return
+
+        # Deepgram JSON shape: results.channels[0].alternatives[0].transcript
+        transcript = (
+            data.get("channel", {}).get("alternatives", [{}])[0].get("transcript")
+            if isinstance(data.get("channel"), dict)
+            else data.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript")
+        )
+        if not transcript:
+            return
+
+        is_final = bool(data.get("is_final") or data.get("speech_final") or data.get("final"))
+        if is_final:
+            final_transcript["text"] = transcript.strip()
+            done.set()
+
+    def on_dg_error(_ws, error):
+        logger.error(f"Deepgram ws error: {error}")
+        done.set()
+
+    def on_dg_close(_ws, status_code, msg):
+        done.set()
+
+    dg_ws = websocket.WebSocketApp(
+        dg_url,
+        header=[f"Authorization: Token {deepgram_key}"],
+        on_message=on_dg_message,
+        on_error=on_dg_error,
+        on_close=on_dg_close,
+    )
+
+    dg_thread = threading.Thread(target=lambda: dg_ws.run_forever(ping_interval=20, ping_timeout=10), daemon=True)
+    dg_thread.start()
+
+    # Wait briefly for Deepgram to connect
+    for _ in range(50):
+        if dg_ws.sock and dg_ws.sock.connected:
+            break
+        if done.is_set():
+            break
+        threading.Event().wait(0.02)
+
+    try:
+        while not done.is_set():
+            raw = ws.receive()
+            if not raw:
+                break
+            try:
+                evt = json.loads(raw)
+            except Exception:
+                continue
+
+            etype = evt.get("event")
+            if etype == "start":
+                start = evt.get("start") or {}
+                call_sid = start.get("callSid") or start.get("call_sid") or ""
+                if call_sid:
+                    call_sid_box["sid"] = call_sid
+                    try:
+                        call_service.update_state(call_id, {"call_sid": call_sid})
+                    except Exception:
+                        pass
+                continue
+
+            if etype == "media":
+                media = evt.get("media") or {}
+                payload_b64 = media.get("payload") or ""
+                if not payload_b64:
+                    continue
+                try:
+                    audio_bytes = base64.b64decode(payload_b64)
+                except Exception:
+                    continue
+                try:
+                    if dg_ws.sock and dg_ws.sock.connected:
+                        dg_ws.send(audio_bytes, opcode=websocket.ABNF.OPCODE_BINARY)
+                except Exception:
+                    # if DG send fails, stop to avoid spinning
+                    done.set()
+                continue
+
+            if etype == "stop":
+                done.set()
+                break
+    finally:
+        try:
+            dg_ws.close()
+        except Exception:
+            pass
+
+    # If we got a final transcript, process it and redirect the live call to /voice/play
+    transcript_text = (final_transcript.get("text") or "").strip()
+    if not transcript_text:
+        return
+
+    processed = call_service.process_transcript(call_id=call_id, transcript=transcript_text)
+    if not processed.get("success"):
+        logger.error(f"process_transcript failed: {processed}")
+        return
+
+    # Redirect call to /voice/play (Twilio will fetch TwiML and play audio)
+    call_sid = call_sid_box.get("sid") or (call_service.get_call_context(call_id) or {}).get("call_sid") or ""
+    if not call_sid:
+        logger.error("Missing call_sid; cannot redirect to /voice/play")
+        return
+
+    try:
+        play_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id})}"
+        call_service.twilio_client.calls(call_sid).update(url=play_url, method="POST")
     except Exception as e:
-        logger.error(f"Voice recording handler failed: {e}", exc_info=True)
-        xml = "<Response><Hangup/></Response>"
-        return xml, 200, {"Content-Type": "application/xml"}
+        logger.error(f"Twilio redirect failed: {e}", exc_info=True)
 
 
 @app.route("/audio/<path:filename>", methods=["GET"])

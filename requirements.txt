@@ -7,3 +7,6 @@ pdf2image==1.16.3
 openai>=1.55.0
 celery[redis]>=5.4.0
 elevenlabs>=1.0.0
+redis>=5.0.0
+flask-sock>=0.7.0
+websocket-client>=1.8.0

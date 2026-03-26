@@ -12,3 +12,4 @@ ENV/
 .DS_Store
 *.db
 *.sqlite
+generated_audio/
