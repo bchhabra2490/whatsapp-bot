@@ -5,7 +5,7 @@ OpenAI client using the official `openai` package for embeddings, chat (with too
 import io
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from openai import OpenAI
 
@@ -59,6 +59,28 @@ class OpenAIClient:
         out = (msg.get("content") or "").strip()
         print("[OpenAIClient] chat: got response")
         return out
+
+    def chat_stream(
+        self, system: str, user: str, temperature: float = 0.2, max_tokens: int = 300
+    ) -> Iterable[str]:
+        """
+        Stream chat completion tokens (text deltas).
+        """
+        resp = self.client.chat.completions.create(
+            model=self.chat_model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        for event in resp:
+            try:
+                delta = event.choices[0].delta
+                text = getattr(delta, "content", None)
+            except Exception:
+                text = None
+            if text:
+                yield text
 
     def _chat_raw(
         self,

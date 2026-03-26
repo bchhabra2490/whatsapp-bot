@@ -19,6 +19,8 @@ import requests
 from twilio.rest import Client as TwilioClient
 from elevenlabs.client import ElevenLabs
 import redis
+import threading
+import time
 
 from services.openai_client import OpenAIClient
 
@@ -255,8 +257,7 @@ class CallService:
                 "- Only set hangup=true when the conversation is complete.\n"
             ),
             user=(
-                f"Conversation so far:\n{history_text}\n\n"
-                f"Most recent callee response (transcript): {transcript}\n"
+                f"Conversation so far:\n{history_text}\n\n" f"Most recent callee response (transcript): {transcript}\n"
             ),
             temperature=0.2,
             max_tokens=140,
@@ -313,6 +314,174 @@ class CallService:
             "response_audio_url": response_tts.get("audio_url"),
             "followup_audio_url": followup_audio_url,
         }
+
+    def start_streaming_response(self, call_id: str, transcript: str, prompt_question: str = "") -> Dict[str, Any]:
+        """
+        Start streaming LLM -> chunked ElevenLabs audio generation in a background thread.
+        Stores chunk URLs in Redis for /voice/play to consume.
+        """
+        context = self.get_call_context(call_id) or {}
+        prompt_to_use = (prompt_question or "").strip() or (str(context.get("prompt_question") or "").strip())
+        if not prompt_to_use:
+            return {"success": False, "error": "Unknown call context"}
+
+        transcript = (transcript or "").strip() or "No speech recognized."
+
+        # Append user turn to history
+        try:
+            state = self._load_state(call_id) or {"call_id": call_id, "history": []}
+            history = state.get("history") if isinstance(state.get("history"), list) else []
+            history.append({"role": "user", "text": transcript})
+            state["history"] = history
+            state["prompt_question"] = prompt_to_use
+            self._save_state(call_id, state)
+            context = state
+        except Exception:
+            pass
+
+        history_lines = []
+        for turn in (context.get("history") or [])[:60]:
+            role = turn.get("role") or "user"
+            text = (turn.get("text") or "").strip()
+            if text:
+                history_lines.append(f"{role}: {text}")
+        history_text = "\n".join(history_lines).strip() or "(none)"
+
+        # Fast control decision (hangup + followup) non-streaming
+        raw = self.openai.chat(
+            system=(
+                "You are controlling a phone-call assistant.\n"
+                "Return STRICT JSON with keys:\n"
+                "- hangup (boolean)\n"
+                "- followup_prompt (string)\n"
+                "Guidelines:\n"
+                "- If you need more info, set hangup=false and ask a concise followup.\n"
+            ),
+            user=(
+                f"Conversation so far:\n{history_text}\n\n" f"Most recent callee response (transcript): {transcript}\n"
+            ),
+            temperature=0.2,
+            max_tokens=80,
+        )
+        try:
+            ctrl = json.loads(raw)
+        except Exception:
+            ctrl = {}
+        hangup = bool(ctrl.get("hangup")) if "hangup" in ctrl else True
+        followup_prompt = str(ctrl.get("followup_prompt") or "").strip()
+        if not hangup and not followup_prompt:
+            followup_prompt = "Anything else you'd like to add?"
+
+        # Initialize streaming state
+        try:
+            self.update_state(
+                call_id,
+                {
+                    "stream_mode": True,
+                    "stream_audio_urls": [],
+                    "stream_done": False,
+                    "stream_error": "",
+                    "hangup": hangup,
+                    "followup_prompt": followup_prompt,
+                    "followup_audio_url": "",
+                },
+            )
+        except Exception:
+            pass
+
+        def _should_flush(buf: str) -> bool:
+            s = buf.strip()
+            if len(s) >= 140:
+                return True
+            if s.endswith((".", "!", "?", "…")) and len(s) >= 40:
+                return True
+            return False
+
+        def worker():
+            chunk_idx = 0
+            buf = ""
+            full_text = ""
+            try:
+                # Stream response text tokens
+                for delta in self.openai.chat_stream(
+                    system=(
+                        "You are speaking in a live phone call.\n"
+                        "Respond naturally and succinctly.\n"
+                        "Output only the words to say (no JSON).\n"
+                    ),
+                    user=(
+                        f"Conversation so far:\n{history_text}\n\n"
+                        f"Most recent callee response (transcript): {transcript}\n\n"
+                        "Speak your response now:"
+                    ),
+                    temperature=0.2,
+                    max_tokens=180,
+                ):
+                    buf += delta
+                    full_text += delta
+                    if _should_flush(buf):
+                        text_chunk = buf.strip()
+                        buf = ""
+                        if text_chunk:
+                            tts = self.synthesize_for_call(call_id=call_id, text=text_chunk, tag=f"chunk_{chunk_idx}")
+                            if tts.get("success"):
+                                # Append chunk URL
+                                for _ in range(3):
+                                    state = self._load_state(call_id) or {}
+                                    urls = (
+                                        state.get("stream_audio_urls")
+                                        if isinstance(state.get("stream_audio_urls"), list)
+                                        else []
+                                    )
+                                    urls.append(tts.get("audio_url"))
+                                    state["stream_audio_urls"] = urls
+                                    self._save_state(call_id, state)
+                                    break
+                            chunk_idx += 1
+                    # Small yield to avoid hogging CPU
+                    time.sleep(0.01)
+
+                # Flush remainder
+                tail = buf.strip()
+                if tail:
+                    tts = self.synthesize_for_call(call_id=call_id, text=tail, tag=f"chunk_{chunk_idx}")
+                    if tts.get("success"):
+                        state = self._load_state(call_id) or {}
+                        urls = (
+                            state.get("stream_audio_urls") if isinstance(state.get("stream_audio_urls"), list) else []
+                        )
+                        urls.append(tts.get("audio_url"))
+                        state["stream_audio_urls"] = urls
+                        self._save_state(call_id, state)
+
+                # Pre-generate followup prompt audio if continuing
+                followup_audio_url = ""
+                if not hangup:
+                    try:
+                        ttsf = self.synthesize_for_call(call_id=call_id, text=followup_prompt, tag="followup")
+                        if ttsf.get("success"):
+                            followup_audio_url = ttsf.get("audio_url") or ""
+                    except Exception:
+                        followup_audio_url = ""
+
+                # Persist completion
+                state = self._load_state(call_id) or {}
+                state.update(
+                    {
+                        "stream_done": True,
+                        "stream_error": "",
+                        "response_text": full_text.strip(),
+                        "followup_audio_url": followup_audio_url,
+                    }
+                )
+                self._save_state(call_id, state)
+            except Exception as e:
+                state = self._load_state(call_id) or {}
+                state.update({"stream_done": True, "stream_error": str(e)})
+                self._save_state(call_id, state)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return {"success": True, "hangup": hangup, "followup_prompt": followup_prompt}
 
     def process_recording(self, call_id: str, recording_url: str, prompt_question: str = "") -> Dict[str, Any]:
         context = self.get_call_context(call_id) or {}

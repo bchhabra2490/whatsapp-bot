@@ -207,12 +207,47 @@ def voice_play():
     or redirects back to /voice/stream-start to listen again.
     """
     call_id = (request.args.get("call_id") or "").strip()
+    idx = int(request.args.get("idx") or "0")
     state = call_service.get_call_context(call_id) or {}
+    stream_mode = bool(state.get("stream_mode"))
+    stream_urls = state.get("stream_audio_urls") if isinstance(state.get("stream_audio_urls"), list) else []
+    stream_done = bool(state.get("stream_done"))
     response_audio_url = (state.get("response_audio_url") or "").strip()
     followup_audio_url = (state.get("followup_audio_url") or "").strip()
     hangup = bool(state.get("hangup"))
 
     parts = ["<Response>"]
+    if stream_mode:
+        # Play next available chunk; if not ready, poll briefly.
+        if idx < len(stream_urls) and stream_urls[idx]:
+            parts.append(f"<Play>{escape(stream_urls[idx])}</Play>")
+            next_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id, 'idx': idx + 1})}"
+            parts.append(f'<Redirect method="POST">{escape(next_url)}</Redirect>')
+            parts.append("</Response>")
+            return "".join(parts), 200, {"Content-Type": "application/xml"}
+
+        if not stream_done:
+            # Wait a moment for next chunk to be generated
+            parts.append('<Pause length="1" />')
+            retry_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id, 'idx': idx})}"
+            parts.append(f'<Redirect method="POST">{escape(retry_url)}</Redirect>')
+            parts.append("</Response>")
+            return "".join(parts), 200, {"Content-Type": "application/xml"}
+
+        # Stream finished but no more chunks to play
+        if not hangup and followup_audio_url:
+            parts.append(f"<Play>{escape(followup_audio_url)}</Play>")
+        if hangup:
+            parts.append("<Hangup/>")
+            parts.append("</Response>")
+            return "".join(parts), 200, {"Content-Type": "application/xml"}
+
+        redirect_url = f"{call_service.base_url}/voice/stream-start?{urlencode({'call_id': call_id})}"
+        parts.append(f'<Redirect method="POST">{escape(redirect_url)}</Redirect>')
+        parts.append("</Response>")
+        return "".join(parts), 200, {"Content-Type": "application/xml"}
+
+    # Non-stream legacy mode (single audio)
     if response_audio_url:
         parts.append(f"<Play>{escape(response_audio_url)}</Play>")
     if not hangup and followup_audio_url:
@@ -372,14 +407,14 @@ def voice_stream(ws):
         except Exception:
             pass
 
-    # If we got a final transcript, process it and redirect the live call to /voice/play
+    # If we got a final transcript, start streaming response generation and redirect to /voice/play
     transcript_text = (final_transcript.get("text") or "").strip()
     if not transcript_text:
         return
 
-    processed = call_service.process_transcript(call_id=call_id, transcript=transcript_text)
-    if not processed.get("success"):
-        logger.error(f"process_transcript failed: {processed}")
+    started = call_service.start_streaming_response(call_id=call_id, transcript=transcript_text)
+    if not started.get("success"):
+        logger.error(f"start_streaming_response failed: {started}")
         return
 
     # Redirect call to /voice/play (Twilio will fetch TwiML and play audio)
@@ -389,7 +424,7 @@ def voice_stream(ws):
         return
 
     try:
-        play_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id})}"
+        play_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id, 'idx': 0})}"
         call_service.twilio_client.calls(call_sid).update(url=play_url, method="POST")
     except Exception as e:
         logger.error(f"Twilio redirect failed: {e}", exc_info=True)
