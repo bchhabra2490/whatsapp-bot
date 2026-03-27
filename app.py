@@ -50,7 +50,7 @@ def webhook():
     try:
         # Get incoming message data
         incoming_message = request.form.get("Body", "")
-        print(f"Incoming message: {incoming_message}")
+        logger.info(f"[webhook] incoming message body='{incoming_message[:120]}'")
         # Twilio sends media as MediaUrl0, MediaUrl1, etc. and MediaContentType0 for the first.
         media_urls = [
             url
@@ -68,11 +68,13 @@ def webhook():
         address = (request.form.get("Address") or "").strip()
         label = (request.form.get("Label") or "").strip()
         has_location = latitude and longitude
-        print(f"Media URLs: {media_urls}, MediaContentType0: {media_content_type0}, Location: {latitude},{longitude}")
+        logger.info(
+            f"[webhook] media_count={len(media_urls)} media_type={media_content_type0} location=({latitude},{longitude})"
+        )
         from_number = request.form.get("From", "")
-        print(f"From number: {from_number}")
+        logger.info(f"[webhook] from={from_number}")
         message_sid = request.form.get("MessageSid", "")
-        print(f"Message SID: {message_sid}")
+        logger.info(f"[webhook] message_sid={message_sid}")
 
         # Create Twilio response
         resp = MessagingResponse()
@@ -162,7 +164,7 @@ def voice_call():
     call_id = (request.args.get("call_id") or "").strip()
     prompt_from_query = (request.args.get("prompt_question") or "").strip()
     context = call_service.get_call_context(call_id) if call_id else None
-    print(f"Context: {context}")
+    logger.info(f"[voice_call] call_id={call_id} has_context={bool(context)}")
 
     if not context and not prompt_from_query:
         # Return valid TwiML even on error.
@@ -182,15 +184,17 @@ def voice_call():
     except Exception:
         pass
 
-    # Start Twilio Media Stream (realtime) to /voice/stream
+    # Start Twilio Media Stream (realtime) to /voice/stream.
+    # Pass call_id via <Parameter> because query strings may not be preserved reliably.
     ws_base = call_service.base_url.replace("https://", "wss://").replace("http://", "ws://")
-    stream_query = urlencode({"call_id": call_id})
-    stream_url = f"{ws_base}/voice/stream?{stream_query}"
+    stream_url = f"{ws_base}/voice/stream"
     xml = (
         "<Response>"
         f"<Play>{escape(prompt_tts.get('audio_url') or '')}</Play>"
         "<Start>"
-        f'<Stream url="{escape(stream_url)}" />'
+        f'<Stream url="{escape(stream_url)}">'
+        f'<Parameter name="call_id" value="{escape(call_id)}" />'
+        "</Stream>"
         "</Start>"
         # Keep call alive while stream runs; call control will redirect to /voice/play when ready.
         '<Pause length="600" />'
@@ -208,7 +212,12 @@ def voice_play():
     """
     call_id = (request.args.get("call_id") or "").strip()
     idx = int(request.args.get("idx") or "0")
+    try:
+        call_service.update_state(call_id, {"playback_active": True})
+    except Exception:
+        pass
     state = call_service.get_call_context(call_id) or {}
+    logger.info(f"[voice_play] call_id={call_id} idx={idx}")
     stream_mode = bool(state.get("stream_mode"))
     stream_urls = state.get("stream_audio_urls") if isinstance(state.get("stream_audio_urls"), list) else []
     stream_done = bool(state.get("stream_done"))
@@ -238,11 +247,19 @@ def voice_play():
         if not hangup and followup_audio_url:
             parts.append(f"<Play>{escape(followup_audio_url)}</Play>")
         if hangup:
+            try:
+                call_service.update_state(call_id, {"playback_active": False})
+            except Exception:
+                pass
             parts.append("<Hangup/>")
             parts.append("</Response>")
             return "".join(parts), 200, {"Content-Type": "application/xml"}
 
         redirect_url = f"{call_service.base_url}/voice/stream-start?{urlencode({'call_id': call_id})}"
+        try:
+            call_service.update_state(call_id, {"playback_active": False})
+        except Exception:
+            pass
         parts.append(f'<Redirect method="POST">{escape(redirect_url)}</Redirect>')
         parts.append("</Response>")
         return "".join(parts), 200, {"Content-Type": "application/xml"}
@@ -254,12 +271,20 @@ def voice_play():
         parts.append(f"<Play>{escape(followup_audio_url)}</Play>")
 
     if hangup:
+        try:
+            call_service.update_state(call_id, {"playback_active": False})
+        except Exception:
+            pass
         parts.append("<Hangup/>")
         parts.append("</Response>")
         return "".join(parts), 200, {"Content-Type": "application/xml"}
 
     # Resume streaming for next user response
     redirect_url = f"{call_service.base_url}/voice/stream-start?{urlencode({'call_id': call_id})}"
+    try:
+        call_service.update_state(call_id, {"playback_active": False})
+    except Exception:
+        pass
     parts.append(f'<Redirect method="POST">{escape(redirect_url)}</Redirect>')
     parts.append("</Response>")
     return "".join(parts), 200, {"Content-Type": "application/xml"}
@@ -271,12 +296,18 @@ def voice_stream_start():
     Starts / restarts Twilio Media Stream for the call.
     """
     call_id = (request.args.get("call_id") or "").strip()
+    try:
+        call_service.update_state(call_id, {"playback_active": False})
+    except Exception:
+        pass
     ws_base = call_service.base_url.replace("https://", "wss://").replace("http://", "ws://")
-    stream_url = f"{ws_base}/voice/stream?{urlencode({'call_id': call_id})}"
+    stream_url = f"{ws_base}/voice/stream"
     xml = (
         "<Response>"
         "<Start>"
-        f'<Stream url="{escape(stream_url)}" />'
+        f'<Stream url="{escape(stream_url)}">'
+        f'<Parameter name="call_id" value="{escape(call_id)}" />'
+        "</Stream>"
         "</Start>"
         '<Pause length="600" />'
         "</Response>"
@@ -293,8 +324,6 @@ def voice_stream(ws):
     - On final transcript, runs LLM->ElevenLabs and redirects the live call to /voice/play
     """
     call_id = (request.args.get("call_id") or "").strip()
-    if not call_id:
-        return
 
     deepgram_key = (os.getenv("DEEPGRAM_API_KEY") or "").strip()
     if not deepgram_key:
@@ -312,14 +341,22 @@ def voice_stream(ws):
     final_transcript = {"text": ""}
     call_sid_box = {"sid": ""}
     done = threading.Event()
+    voiced_frames = 0
+    barge_in_triggered = False
+    media_frames = 0
+
+    def is_probably_voiced(audio_bytes: bytes) -> bool:
+        if not audio_bytes:
+            return False
+        unique_ratio = len(set(audio_bytes)) / float(len(audio_bytes))
+        threshold = float(os.getenv("BARGE_IN_VOICE_THRESHOLD") or "0.12")
+        return unique_ratio >= threshold
 
     def on_dg_message(_ws, message):
         try:
             data = json.loads(message)
         except Exception:
             return
-
-        # Deepgram JSON shape: results.channels[0].alternatives[0].transcript
         transcript = (
             data.get("channel", {}).get("alternatives", [{}])[0].get("transcript")
             if isinstance(data.get("channel"), dict)
@@ -327,7 +364,7 @@ def voice_stream(ws):
         )
         if not transcript:
             return
-
+        logger.info(f"[voice_stream] partial transcript chars={len(transcript)}")
         is_final = bool(data.get("is_final") or data.get("speech_final") or data.get("final"))
         if is_final:
             final_transcript["text"] = transcript.strip()
@@ -347,11 +384,10 @@ def voice_stream(ws):
         on_error=on_dg_error,
         on_close=on_dg_close,
     )
-
     dg_thread = threading.Thread(target=lambda: dg_ws.run_forever(ping_interval=20, ping_timeout=10), daemon=True)
     dg_thread.start()
 
-    # Wait briefly for Deepgram to connect
+    # Wait briefly for DG connection
     for _ in range(50):
         if dg_ws.sock and dg_ws.sock.connected:
             break
@@ -372,16 +408,22 @@ def voice_stream(ws):
             etype = evt.get("event")
             if etype == "start":
                 start = evt.get("start") or {}
+                custom_params = start.get("customParameters") or start.get("custom_parameters") or {}
+                if not call_id:
+                    call_id = (custom_params.get("call_id") or custom_params.get("callId") or "").strip()
                 call_sid = start.get("callSid") or start.get("call_sid") or ""
+                logger.info(f"[voice_stream] start received call_id={call_id} call_sid={call_sid}")
                 if call_sid:
                     call_sid_box["sid"] = call_sid
                     try:
-                        call_service.update_state(call_id, {"call_sid": call_sid})
+                        if call_id:
+                            call_service.update_state(call_id, {"call_sid": call_sid})
                     except Exception:
                         pass
                 continue
 
             if etype == "media":
+                media_frames += 1
                 media = evt.get("media") or {}
                 payload_b64 = media.get("payload") or ""
                 if not payload_b64:
@@ -390,11 +432,42 @@ def voice_stream(ws):
                     audio_bytes = base64.b64decode(payload_b64)
                 except Exception:
                     continue
+
+                # Barge-in: if user starts speaking while playback is active, stop playback immediately.
+                state = call_service.get_call_context(call_id) or {}
+                if bool(state.get("playback_active")) and not barge_in_triggered:
+                    if is_probably_voiced(audio_bytes):
+                        voiced_frames += 1
+                    else:
+                        voiced_frames = max(0, voiced_frames - 1)
+                    # ~6 frames ~= 120ms; quick enough to interrupt playback.
+                    if voiced_frames >= int(os.getenv("BARGE_IN_MIN_FRAMES") or "6"):
+                        call_sid = call_sid_box.get("sid") or (state.get("call_sid") or "")
+                        if call_sid:
+                            try:
+                                call_service.update_state(
+                                    call_id,
+                                    {
+                                        "playback_active": False,
+                                        "discard_last_assistant": True,
+                                    },
+                                )
+                                restart_url = (
+                                    f"{call_service.base_url}/voice/stream-start?{urlencode({'call_id': call_id})}"
+                                )
+                                call_service.twilio_client.calls(call_sid).update(url=restart_url, method="POST")
+                                barge_in_triggered = True
+                                done.set()
+                                continue
+                            except Exception as e:
+                                logger.error(f"Barge-in redirect failed: {e}", exc_info=True)
+
                 try:
                     if dg_ws.sock and dg_ws.sock.connected:
                         dg_ws.send(audio_bytes, opcode=websocket.ABNF.OPCODE_BINARY)
+                        if media_frames % 100 == 0:
+                            logger.info(f"[voice_stream] forwarded frames={media_frames} call_id={call_id}")
                 except Exception:
-                    # if DG send fails, stop to avoid spinning
                     done.set()
                 continue
 
@@ -407,25 +480,36 @@ def voice_stream(ws):
         except Exception:
             pass
 
-    # If we got a final transcript, start streaming response generation and redirect to /voice/play
+    if not call_id:
+        logger.error("[voice_stream] call_id missing; cannot continue")
+        return
+
     transcript_text = (final_transcript.get("text") or "").strip()
     if not transcript_text:
+        logger.info(f"[voice_stream] No final transcript for call_id={call_id}")
+        return
+    logger.info(
+        f"[voice_stream] final transcript chars={len(transcript_text)} frames={media_frames} call_id={call_id}"
+    )
+
+    # If barge-in already triggered a redirect, don't produce a response from stale transcript.
+    if barge_in_triggered:
         return
 
     started = call_service.start_streaming_response(call_id=call_id, transcript=transcript_text)
     if not started.get("success"):
         logger.error(f"start_streaming_response failed: {started}")
         return
+    logger.info(f"[voice_stream] streaming response started call_id={call_id}")
 
-    # Redirect call to /voice/play (Twilio will fetch TwiML and play audio)
     call_sid = call_sid_box.get("sid") or (call_service.get_call_context(call_id) or {}).get("call_sid") or ""
     if not call_sid:
         logger.error("Missing call_sid; cannot redirect to /voice/play")
         return
-
     try:
         play_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id, 'idx': 0})}"
         call_service.twilio_client.calls(call_sid).update(url=play_url, method="POST")
+        logger.info(f"[voice_stream] redirected call to play call_id={call_id} call_sid={call_sid}")
     except Exception as e:
         logger.error(f"Twilio redirect failed: {e}", exc_info=True)
 

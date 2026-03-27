@@ -10,6 +10,7 @@ import os
 import re
 import uuid
 import json
+import logging
 from urllib.parse import urlencode
 from pathlib import Path
 from threading import Lock
@@ -23,6 +24,8 @@ import threading
 import time
 
 from services.openai_client import OpenAIClient
+
+logger = logging.getLogger(__name__)
 
 
 class CallService:
@@ -81,7 +84,28 @@ class CallService:
         state = self._load_state(call_id) or {"call_id": call_id, "history": []}
         state.update(updates or {})
         self._save_state(call_id, state)
+        if updates:
+            logger.info(f"[CallService] state updated call_id={call_id} keys={list(updates.keys())}")
         return state
+
+    @staticmethod
+    def _drop_recent_assistant_turns(history: list, max_drop: int = 2) -> list:
+        """
+        Remove the most recent assistant turns from history.
+        Used for barge-in: if user interrupts playback, assume they did not hear
+        the latest assistant response/follow-up.
+        """
+        if not isinstance(history, list) or not history:
+            return []
+        dropped = 0
+        out = list(history)
+        while out and dropped < max_drop:
+            if (out[-1] or {}).get("role") == "assistant":
+                out.pop()
+                dropped += 1
+            else:
+                break
+        return out
 
     @staticmethod
     def _normalize_phone_number(raw: str) -> str:
@@ -142,6 +166,7 @@ class CallService:
             url=f"{self.base_url}/voice/call?{query}",
             method="POST",
         )
+        logger.info(f"[CallService] outbound call started call_id={call_id} call_sid={call.sid} to={normalized_to}")
         return {"success": True, "call_id": call_id, "call_sid": call.sid, "to_number": normalized_to}
 
     def get_call_context(self, call_id: str) -> Optional[Dict[str, Any]]:
@@ -220,6 +245,7 @@ class CallService:
             return {"success": False, "error": "Unknown call context"}
 
         transcript = (transcript or "").strip() or "No speech recognized."
+        logger.info(f"[CallService] process_transcript call_id={call_id} chars={len(transcript)}")
 
         # Update Redis history with the user's turn
         try:
@@ -272,6 +298,9 @@ class CallService:
         followup_prompt = str(parsed.get("followup_prompt") or "").strip()
         if not hangup and not followup_prompt:
             followup_prompt = "Anything else you'd like to add?"
+        logger.info(
+            f"[CallService] llm decision call_id={call_id} hangup={hangup} response_chars={len(response_text)} followup_chars={len(followup_prompt)}"
+        )
 
         response_tts = self.synthesize_for_call(call_id=call_id, text=response_text, tag="response")
         if not response_tts.get("success"):
@@ -326,11 +355,16 @@ class CallService:
             return {"success": False, "error": "Unknown call context"}
 
         transcript = (transcript or "").strip() or "No speech recognized."
+        logger.info(f"[CallService] start_streaming_response call_id={call_id} transcript_chars={len(transcript)}")
 
         # Append user turn to history
         try:
             state = self._load_state(call_id) or {"call_id": call_id, "history": []}
             history = state.get("history") if isinstance(state.get("history"), list) else []
+            # If caller barged in during playback, discard the last assistant output from context.
+            if bool(state.get("discard_last_assistant")):
+                history = self._drop_recent_assistant_turns(history, max_drop=2)
+                state["discard_last_assistant"] = False
             history.append({"role": "user", "text": transcript})
             state["history"] = history
             state["prompt_question"] = prompt_to_use
@@ -371,6 +405,7 @@ class CallService:
         followup_prompt = str(ctrl.get("followup_prompt") or "").strip()
         if not hangup and not followup_prompt:
             followup_prompt = "Anything else you'd like to add?"
+        logger.info(f"[CallService] stream control call_id={call_id} hangup={hangup} followup_chars={len(followup_prompt)}")
 
         # Initialize streaming state
         try:
@@ -384,6 +419,7 @@ class CallService:
                     "hangup": hangup,
                     "followup_prompt": followup_prompt,
                     "followup_audio_url": "",
+                    "playback_active": False,
                 },
             )
         except Exception:
@@ -437,6 +473,7 @@ class CallService:
                                     state["stream_audio_urls"] = urls
                                     self._save_state(call_id, state)
                                     break
+                                logger.info(f"[CallService] stream tts chunk ready call_id={call_id} chunk_idx={chunk_idx}")
                             chunk_idx += 1
                     # Small yield to avoid hogging CPU
                     time.sleep(0.01)
@@ -453,6 +490,7 @@ class CallService:
                         urls.append(tts.get("audio_url"))
                         state["stream_audio_urls"] = urls
                         self._save_state(call_id, state)
+                        logger.info(f"[CallService] stream tts tail ready call_id={call_id} chunk_idx={chunk_idx}")
 
                 # Pre-generate followup prompt audio if continuing
                 followup_audio_url = ""
@@ -475,10 +513,14 @@ class CallService:
                     }
                 )
                 self._save_state(call_id, state)
+                logger.info(
+                    f"[CallService] stream complete call_id={call_id} total_chars={len(full_text.strip())} total_chunks={chunk_idx + (1 if tail else 0)}"
+                )
             except Exception as e:
                 state = self._load_state(call_id) or {}
                 state.update({"stream_done": True, "stream_error": str(e)})
                 self._save_state(call_id, state)
+                logger.error(f"[CallService] stream worker failed call_id={call_id}: {e}", exc_info=True)
 
         threading.Thread(target=worker, daemon=True).start()
         return {"success": True, "hangup": hangup, "followup_prompt": followup_prompt}
