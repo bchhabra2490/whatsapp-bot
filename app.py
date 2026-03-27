@@ -38,6 +38,77 @@ openai_client = OpenAIClient()
 call_service = CallService(twilio_client=twilio_client, openai_client=openai_client)
 
 
+def _normalize_whatsapp_number(raw: str) -> str:
+    to_number = (raw or "").strip()
+    if not to_number:
+        return ""
+    if not to_number.lower().startswith("whatsapp:"):
+        to_number = f"whatsapp:{to_number}" if to_number.startswith("+") else f"whatsapp:+{to_number}"
+    return to_number
+
+
+def _get_twilio_whatsapp_from() -> str:
+    twilio_from = (os.getenv("TWILIO_WHATSAPP_NUMBER") or "").strip()
+    if not twilio_from:
+        return ""
+    if not twilio_from.lower().startswith("whatsapp:"):
+        twilio_from = f"whatsapp:{twilio_from}" if twilio_from.startswith("+") else f"whatsapp:+{twilio_from}"
+    return twilio_from
+
+
+def _send_call_summary_to_whatsapp_async(call_id: str) -> None:
+    """
+    Fire-and-forget: send a call summary to the WhatsApp requester.
+    """
+
+    def worker():
+        try:
+            state = call_service.get_call_context(call_id) or {}
+            requested_by = _normalize_whatsapp_number(state.get("requested_by") or "")
+            twilio_from = _get_twilio_whatsapp_from()
+            if not (requested_by and twilio_from):
+                logger.error(
+                    f"[call_summary] missing numbers call_id={call_id} requested_by={requested_by} twilio_from={twilio_from}"
+                )
+                return
+
+            purpose = (state.get("purpose_of_call") or state.get("purpose") or "").strip()
+            history = state.get("history") if isinstance(state.get("history"), list) else []
+            # Build a compact transcript for summarization
+            lines = []
+            for turn in history[-20:]:
+                role = (turn.get("role") or "user").strip()
+                text = (turn.get("text") or "").strip()
+                if text:
+                    lines.append(f"{role}: {text}")
+            transcript = "\n".join(lines).strip()
+
+            summary = openai_client.chat(
+                system=(
+                    "Summarize a phone call for the person who requested the call.\n"
+                    "Be concise and actionable. Do not mention internal tools.\n"
+                    "Return plain text.\n"
+                ),
+                user=(
+                    f"Purpose of call:\n{purpose or '(not provided)'}\n\n"
+                    f"Conversation (most recent last):\n{transcript or '(no transcript)'}\n\n"
+                    "Write:\n"
+                    "- 3-6 bullet summary\n"
+                    "- Any commitments / next steps\n"
+                ),
+                temperature=0.2,
+                max_tokens=250,
+            ).strip()
+
+            body = f"📞 Call summary\n\n{summary}".strip()
+            twilio_client.messages.create(from_=twilio_from, to=requested_by, body=body)
+            logger.info(f"[call_summary] sent to={requested_by} call_id={call_id}")
+        except Exception as e:
+            logger.error(f"[call_summary] failed call_id={call_id}: {e}", exc_info=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint"""
@@ -251,6 +322,7 @@ def voice_play():
             call_service.update_state(call_id, {"playback_active": False})
         except Exception:
             pass
+        _send_call_summary_to_whatsapp_async(call_id)
         parts.append("<Hangup/>")
         parts.append("</Response>")
         return "".join(parts), 200, {"Content-Type": "application/xml"}

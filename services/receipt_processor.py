@@ -167,8 +167,14 @@ class RecordProcessor:
         )
         user = f"Latest user message:\n{message}"
         raw = self.openai.chat(system=system, user=user, temperature=0.0, max_tokens=120)
+        cleaned = (raw or "").strip()
+        # Models sometimes wrap JSON in markdown fences: ```json ... ```
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`").strip()
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(cleaned)
         except Exception:
             parsed = {}
         return {

@@ -268,6 +268,7 @@ class CallService:
                 "Guidelines:\n"
                 "- If you need more info, set hangup=false and ask a concise followup.\n"
                 "- Hangup only if the purpose of the call is achieved."
+                "- If you are not sure about some information, do not make it up. Try to use defaults which are harmless"
             ),
             user=(
                 f"Conversation so far:\n{history_text}\n\n" f"Most recent callee response (transcript): {transcript}\n"
@@ -324,6 +325,7 @@ class CallService:
                         "Respond naturally and succinctly.\n"
                         f"Stick to the Purpose of the call: {purpose}\n"
                         "Output only the words to say (no JSON).\n"
+                        "If you are not sure about some information, do not make it up. Try to use defaults which are harmless"
                     ),
                     user=(
                         f"Purpose of the call:\n{purpose}\n\n"
