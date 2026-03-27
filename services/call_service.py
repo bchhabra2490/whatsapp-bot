@@ -115,7 +115,9 @@ class CallService:
             return f"+{digits}"
         return ""
 
-    def start_outbound_call(self, requested_by: str, to_number: str, prompt_question: str) -> Dict[str, Any]:
+    def start_outbound_call(
+        self, requested_by: str, to_number: str, prompt_question: str, purpose_of_call: str
+    ) -> Dict[str, Any]:
         if not self.twilio_voice_from:
             return {"success": False, "error": "TWILIO_VOICE_NUMBER is not configured"}
         if not self.base_url:
@@ -132,6 +134,7 @@ class CallService:
                 "requested_by": requested_by,
                 "to_number": normalized_to,
                 "prompt_question": prompt_question,
+                "purpose_of_call": purpose_of_call,
             }
         # Persist initial call state in Redis so voice webhooks (separate process) can retrieve it.
         try:
@@ -143,7 +146,7 @@ class CallService:
                     "to_number": normalized_to,
                     "prompt_question": prompt_question,
                     # "purpose" stays constant across call turns so the model sticks to the initial goal.
-                    "purpose": prompt_question,
+                    "purpose_of_call": purpose_of_call,
                     "history": [
                         {"role": "assistant", "text": prompt_question},
                     ],
@@ -159,6 +162,7 @@ class CallService:
                 "prompt_question": prompt_question,
                 "requested_by": requested_by,
                 "to_number": normalized_to,
+                "purpose_of_call": purpose_of_call,
             }
         )
         call = self.twilio_client.calls.create(
@@ -243,7 +247,7 @@ class CallService:
         except Exception:
             pass
 
-        purpose = str(context.get("purpose") or prompt_to_use).strip()
+        purpose = str(context.get("purpose_of_call") or prompt_to_use).strip()
 
         history_lines = []
         for turn in (context.get("history") or [])[:60]:
@@ -263,6 +267,7 @@ class CallService:
                 "- followup_prompt (string)\n"
                 "Guidelines:\n"
                 "- If you need more info, set hangup=false and ask a concise followup.\n"
+                "- Hangup only if the purpose of the call is achieved."
             ),
             user=(
                 f"Conversation so far:\n{history_text}\n\n" f"Most recent callee response (transcript): {transcript}\n"

@@ -138,6 +138,7 @@ class RecordProcessor:
         Parse a free-form call request into:
           - target_number
           - question_to_ask
+          - purpose_of_call
         """
 
         hour = datetime.now().hour
@@ -152,11 +153,12 @@ class RecordProcessor:
 
         system = (
             "Extract phone call instructions from a WhatsApp message.\n"
-            "Return STRICT JSON with keys: target_number, question_to_ask.\n"
+            "Return STRICT JSON with keys: target_number, question_to_ask, purpose_of_call.\n"
             "\n"
             "Rules:\n"
             "- target_number: keep phone digits with optional leading + only.\n"
             "- question_to_ask: MUST be a natural spoken script for the call (not a command).\n"
+            "- purpose_of_call: MUST be exact purpose to guide the LLMs.\n"
             f"- Start with a brief greeting based on time of day: '{greeting}'.\n"
             "- Include a polite opener and a clear question.\n"
             "- Add ellipses '...' for short pauses (at least 1-2 places).\n"
@@ -172,6 +174,7 @@ class RecordProcessor:
         return {
             "target_number": str(parsed.get("target_number") or "").strip(),
             "question_to_ask": str(parsed.get("question_to_ask") or "").strip(),
+            "purpose_of_call": str(parsed.get("purpose_of_call") or "").strip(),
         }
 
     def answer_question(

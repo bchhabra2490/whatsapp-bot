@@ -164,6 +164,7 @@ def voice_call():
     call_id = (request.args.get("call_id") or "").strip()
     prompt_from_query = (request.args.get("prompt_question") or "").strip()
     context = call_service.get_call_context(call_id) if call_id else None
+    purpose_of_call = context.get("purpose_of_call") if context else None
     logger.info(f"[voice_call] call_id={call_id} has_context={bool(context)}")
 
     if not context and not prompt_from_query:
@@ -194,6 +195,7 @@ def voice_call():
         "<Start>"
         f'<Stream url="{escape(stream_url)}">'
         f'<Parameter name="call_id" value="{escape(call_id)}" />'
+        f'<Parameter name="purpose_of_call" value="{escape(purpose_of_call)}" />'
         "</Stream>"
         "</Start>"
         # Keep call alive while stream runs; call control will redirect to /voice/play when ready.
@@ -270,6 +272,7 @@ def voice_stream_start():
     Starts / restarts Twilio Media Stream for the call.
     """
     call_id = (request.args.get("call_id") or "").strip()
+    purpose_of_call = (request.args.get("purpose_of_call") or "").strip()
     try:
         call_service.update_state(call_id, {"playback_active": False})
     except Exception:
@@ -281,6 +284,7 @@ def voice_stream_start():
         "<Start>"
         f'<Stream url="{escape(stream_url)}">'
         f'<Parameter name="call_id" value="{escape(call_id)}" />'
+        f'<Parameter name="purpose_of_call" value="{escape(purpose_of_call)}" />'
         "</Stream>"
         "</Start>"
         '<Pause length="600" />'
@@ -298,7 +302,8 @@ def voice_stream(ws):
     - On final transcript, runs LLM->ElevenLabs and redirects the live call to /voice/play
     """
     call_id = (request.args.get("call_id") or "").strip()
-
+    purpose_of_call = (request.args.get("purpose_of_call") or "").strip()
+    logger.info(f"[voice_stream] call_id={call_id} purpose_of_call={purpose_of_call}")
     deepgram_key = (os.getenv("DEEPGRAM_API_KEY") or "").strip()
     if not deepgram_key:
         logger.error("DEEPGRAM_API_KEY missing; cannot stream")

@@ -75,9 +75,10 @@ class WhatsAppHandler:
                 return "❌ Calling is not configured yet."
 
             extracted = self.processor.extract_call_request(message=message)
+            purpose_of_call = extracted.get("purpose_of_call") or ""
             target_number = extracted.get("target_number") or ""
             question_to_ask = extracted.get("question_to_ask") or ""
-            if not target_number or not question_to_ask:
+            if not target_number or not question_to_ask or not purpose_of_call:
                 return (
                     "❌ I couldn't parse the call details.\n"
                     "Try: call +1234567890 and ask if they can share the shipment ETA."
@@ -87,6 +88,7 @@ class WhatsAppHandler:
                 requested_by=from_number,
                 to_number=target_number,
                 prompt_question=question_to_ask,
+                purpose_of_call=purpose_of_call,
             )
             print(f"[WhatsAppHandler] start_outbound_call result: {started}")
             if started.get("success"):

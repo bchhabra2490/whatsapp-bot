@@ -60,9 +60,7 @@ class OpenAIClient:
         print("[OpenAIClient] chat: got response")
         return out
 
-    def chat_stream(
-        self, system: str, user: str, temperature: float = 0.2, max_tokens: int = 300
-    ) -> Iterable[str]:
+    def chat_stream(self, system: str, user: str, temperature: float = 0.2, max_tokens: int = 300) -> Iterable[str]:
         """
         Stream chat completion tokens (text deltas).
         """
