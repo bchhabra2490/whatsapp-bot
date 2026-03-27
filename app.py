@@ -218,55 +218,29 @@ def voice_play():
         pass
     state = call_service.get_call_context(call_id) or {}
     logger.info(f"[voice_play] call_id={call_id} idx={idx}")
-    stream_mode = bool(state.get("stream_mode"))
     stream_urls = state.get("stream_audio_urls") if isinstance(state.get("stream_audio_urls"), list) else []
     stream_done = bool(state.get("stream_done"))
-    response_audio_url = (state.get("response_audio_url") or "").strip()
     followup_audio_url = (state.get("followup_audio_url") or "").strip()
     hangup = bool(state.get("hangup"))
 
     parts = ["<Response>"]
-    if stream_mode:
-        # Play next available chunk; if not ready, poll briefly.
-        if idx < len(stream_urls) and stream_urls[idx]:
-            parts.append(f"<Play>{escape(stream_urls[idx])}</Play>")
-            next_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id, 'idx': idx + 1})}"
-            parts.append(f'<Redirect method="POST">{escape(next_url)}</Redirect>')
-            parts.append("</Response>")
-            return "".join(parts), 200, {"Content-Type": "application/xml"}
-
-        if not stream_done:
-            # Wait a moment for next chunk to be generated
-            parts.append('<Pause length="1" />')
-            retry_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id, 'idx': idx})}"
-            parts.append(f'<Redirect method="POST">{escape(retry_url)}</Redirect>')
-            parts.append("</Response>")
-            return "".join(parts), 200, {"Content-Type": "application/xml"}
-
-        # Stream finished but no more chunks to play
-        if not hangup and followup_audio_url:
-            parts.append(f"<Play>{escape(followup_audio_url)}</Play>")
-        if hangup:
-            try:
-                call_service.update_state(call_id, {"playback_active": False})
-            except Exception:
-                pass
-            parts.append("<Hangup/>")
-            parts.append("</Response>")
-            return "".join(parts), 200, {"Content-Type": "application/xml"}
-
-        redirect_url = f"{call_service.base_url}/voice/stream-start?{urlencode({'call_id': call_id})}"
-        try:
-            call_service.update_state(call_id, {"playback_active": False})
-        except Exception:
-            pass
-        parts.append(f'<Redirect method="POST">{escape(redirect_url)}</Redirect>')
+    # Play next available chunk; if not ready, poll briefly.
+    if idx < len(stream_urls) and stream_urls[idx]:
+        parts.append(f"<Play>{escape(stream_urls[idx])}</Play>")
+        next_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id, 'idx': idx + 1})}"
+        parts.append(f'<Redirect method="POST">{escape(next_url)}</Redirect>')
         parts.append("</Response>")
         return "".join(parts), 200, {"Content-Type": "application/xml"}
 
-    # Non-stream legacy mode (single audio)
-    if response_audio_url:
-        parts.append(f"<Play>{escape(response_audio_url)}</Play>")
+    if not stream_done:
+        # Wait a moment for next chunk to be generated
+        parts.append('<Pause length="1" />')
+        retry_url = f"{call_service.base_url}/voice/play?{urlencode({'call_id': call_id, 'idx': idx})}"
+        parts.append(f'<Redirect method="POST">{escape(retry_url)}</Redirect>')
+        parts.append("</Response>")
+        return "".join(parts), 200, {"Content-Type": "application/xml"}
+
+    # Stream finished but no more chunks to play
     if not hangup and followup_audio_url:
         parts.append(f"<Play>{escape(followup_audio_url)}</Play>")
 

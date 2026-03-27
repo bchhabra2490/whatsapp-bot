@@ -16,7 +16,6 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, Optional
 
-import requests
 from twilio.rest import Client as TwilioClient
 from elevenlabs.client import ElevenLabs
 import redis
@@ -143,6 +142,8 @@ class CallService:
                     "requested_by": requested_by,
                     "to_number": normalized_to,
                     "prompt_question": prompt_question,
+                    # "purpose" stays constant across call turns so the model sticks to the initial goal.
+                    "purpose": prompt_question,
                     "history": [
                         {"role": "assistant", "text": prompt_question},
                     ],
@@ -176,24 +177,6 @@ class CallService:
             return state
         with self._lock:
             return self._pending_calls.get(call_id)
-
-    def _transcribe_with_deepgram(self, audio_bytes: bytes, content_type: str) -> str:
-        if not self.deepgram_api_key:
-            raise ValueError("DEEPGRAM_API_KEY is not configured")
-        resp = requests.post(
-            "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&punctuate=true",
-            headers={
-                "Authorization": f"Token {self.deepgram_api_key}",
-                "Content-Type": content_type or "audio/wav",
-            },
-            data=audio_bytes,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return (
-            data.get("results", {}).get("channels", [{}])[0].get("alternatives", [{}])[0].get("transcript", "").strip()
-        )
 
     def _synthesize_with_elevenlabs(self, text: str, output_path: Path) -> None:
         if not self.elevenlabs_api_key:
@@ -231,119 +214,6 @@ class CallService:
         self._synthesize_with_elevenlabs((text or "").strip(), output_path=output_path)
         return {"success": True, "audio_url": f"{self.base_url}/audio/{filename}", "filename": filename}
 
-    def process_transcript(self, call_id: str, transcript: str, prompt_question: str = "") -> Dict[str, Any]:
-        """
-        Process a transcript (from realtime Deepgram or fallback recording):
-        - append transcript to Redis history
-        - run LLM to produce {response_text, hangup, followup_prompt}
-        - synthesize ElevenLabs audio for response and followup (if needed)
-        - persist decision + audio URLs in Redis
-        """
-        context = self.get_call_context(call_id) or {}
-        prompt_to_use = (prompt_question or "").strip() or (str(context.get("prompt_question") or "").strip())
-        if not prompt_to_use:
-            return {"success": False, "error": "Unknown call context"}
-
-        transcript = (transcript or "").strip() or "No speech recognized."
-        logger.info(f"[CallService] process_transcript call_id={call_id} chars={len(transcript)}")
-
-        # Update Redis history with the user's turn
-        try:
-            state = self._load_state(call_id) or {
-                "call_id": call_id,
-                "prompt_question": prompt_to_use,
-                "history": [],
-            }
-            history = state.get("history") if isinstance(state.get("history"), list) else []
-            history.append({"role": "user", "text": transcript})
-            state["history"] = history
-            state["prompt_question"] = prompt_to_use
-            self._save_state(call_id, state)
-            context = state
-        except Exception:
-            pass
-
-        history_lines = []
-        for turn in (context.get("history") or [])[:60]:
-            role = turn.get("role") or "user"
-            text = (turn.get("text") or "").strip()
-            if text:
-                history_lines.append(f"{role}: {text}")
-        history_text = "\n".join(history_lines).strip() or "(none)"
-
-        raw = self.openai.chat(
-            system=(
-                "You are controlling a phone-call assistant.\n"
-                "Return STRICT JSON with keys:\n"
-                "- response_text (string): what to say to the callee now.\n"
-                "- hangup (boolean): true if the call should end now.\n"
-                "- followup_prompt (string): if NOT hanging up, what question to ask next.\n"
-                "Guidelines:\n"
-                "- Keep response_text concise (ideally 1 short sentence).\n"
-                "- Only set hangup=true when the conversation is complete.\n"
-            ),
-            user=(
-                f"Conversation so far:\n{history_text}\n\n" f"Most recent callee response (transcript): {transcript}\n"
-            ),
-            temperature=0.2,
-            max_tokens=140,
-        )
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            parsed = {}
-
-        response_text = str(parsed.get("response_text") or "").strip() or "Thanks — got it."
-        hangup = bool(parsed.get("hangup")) if "hangup" in parsed else True
-        followup_prompt = str(parsed.get("followup_prompt") or "").strip()
-        if not hangup and not followup_prompt:
-            followup_prompt = "Anything else you'd like to add?"
-        logger.info(
-            f"[CallService] llm decision call_id={call_id} hangup={hangup} response_chars={len(response_text)} followup_chars={len(followup_prompt)}"
-        )
-
-        response_tts = self.synthesize_for_call(call_id=call_id, text=response_text, tag="response")
-        if not response_tts.get("success"):
-            return {"success": False, "error": response_tts.get("error") or "tts_failed"}
-
-        followup_audio_url = ""
-        if not hangup:
-            followup_tts = self.synthesize_for_call(call_id=call_id, text=followup_prompt, tag="followup")
-            if followup_tts.get("success"):
-                followup_audio_url = followup_tts.get("audio_url") or ""
-
-        # Persist assistant turn + decision so /voice/play can serve it
-        try:
-            state = self._load_state(call_id) or context or {"call_id": call_id, "history": []}
-            history = state.get("history") if isinstance(state.get("history"), list) else []
-            history.append({"role": "assistant", "text": response_text})
-            if not hangup:
-                history.append({"role": "assistant", "text": followup_prompt})
-            state.update(
-                {
-                    "history": history,
-                    "hangup": hangup,
-                    "response_text": response_text,
-                    "followup_prompt": followup_prompt,
-                    "response_audio_url": response_tts.get("audio_url"),
-                    "followup_audio_url": followup_audio_url,
-                    "prompt_question": followup_prompt if not hangup else prompt_to_use,
-                }
-            )
-            self._save_state(call_id, state)
-        except Exception:
-            pass
-
-        return {
-            "success": True,
-            "transcript": transcript,
-            "response_text": response_text,
-            "hangup": hangup,
-            "followup_prompt": followup_prompt,
-            "response_audio_url": response_tts.get("audio_url"),
-            "followup_audio_url": followup_audio_url,
-        }
-
     def start_streaming_response(self, call_id: str, transcript: str, prompt_question: str = "") -> Dict[str, Any]:
         """
         Start streaming LLM -> chunked ElevenLabs audio generation in a background thread.
@@ -373,6 +243,8 @@ class CallService:
         except Exception:
             pass
 
+        purpose = str(context.get("purpose") or prompt_to_use).strip()
+
         history_lines = []
         for turn in (context.get("history") or [])[:60]:
             role = turn.get("role") or "user"
@@ -385,6 +257,7 @@ class CallService:
         raw = self.openai.chat(
             system=(
                 "You are controlling a phone-call assistant.\n"
+                f"The Purpose of the call is: {purpose}\n"
                 "Return STRICT JSON with keys:\n"
                 "- hangup (boolean)\n"
                 "- followup_prompt (string)\n"
@@ -405,14 +278,15 @@ class CallService:
         followup_prompt = str(ctrl.get("followup_prompt") or "").strip()
         if not hangup and not followup_prompt:
             followup_prompt = "Anything else you'd like to add?"
-        logger.info(f"[CallService] stream control call_id={call_id} hangup={hangup} followup_chars={len(followup_prompt)}")
+        logger.info(
+            f"[CallService] stream control call_id={call_id} hangup={hangup} followup_chars={len(followup_prompt)}"
+        )
 
         # Initialize streaming state
         try:
             self.update_state(
                 call_id,
                 {
-                    "stream_mode": True,
                     "stream_audio_urls": [],
                     "stream_done": False,
                     "stream_error": "",
@@ -443,9 +317,11 @@ class CallService:
                     system=(
                         "You are speaking in a live phone call.\n"
                         "Respond naturally and succinctly.\n"
+                        f"Stick to the Purpose of the call: {purpose}\n"
                         "Output only the words to say (no JSON).\n"
                     ),
                     user=(
+                        f"Purpose of the call:\n{purpose}\n\n"
                         f"Conversation so far:\n{history_text}\n\n"
                         f"Most recent callee response (transcript): {transcript}\n\n"
                         "Speak your response now:"
@@ -473,7 +349,9 @@ class CallService:
                                     state["stream_audio_urls"] = urls
                                     self._save_state(call_id, state)
                                     break
-                                logger.info(f"[CallService] stream tts chunk ready call_id={call_id} chunk_idx={chunk_idx}")
+                                logger.info(
+                                    f"[CallService] stream tts chunk ready call_id={call_id} chunk_idx={chunk_idx}"
+                                )
                             chunk_idx += 1
                     # Small yield to avoid hogging CPU
                     time.sleep(0.01)
@@ -524,27 +402,3 @@ class CallService:
 
         threading.Thread(target=worker, daemon=True).start()
         return {"success": True, "hangup": hangup, "followup_prompt": followup_prompt}
-
-    def process_recording(self, call_id: str, recording_url: str, prompt_question: str = "") -> Dict[str, Any]:
-        context = self.get_call_context(call_id) or {}
-        prompt_to_use = (prompt_question or "").strip() or (str(context.get("prompt_question") or "").strip())
-        if not prompt_to_use:
-            return {"success": False, "error": "Unknown call context"}
-
-        if not recording_url:
-            return {"success": False, "error": "Missing recording URL"}
-
-        # Prefer MP3 to reduce latency and payload size; fall back to WAV.
-        rec_resp = None
-        content_type = ""
-        try:
-            rec_resp = requests.get(f"{recording_url}.mp3", timeout=45)
-            rec_resp.raise_for_status()
-            content_type = rec_resp.headers.get("Content-Type", "audio/mpeg")
-        except Exception:
-            rec_resp = requests.get(f"{recording_url}.wav", timeout=60)
-            rec_resp.raise_for_status()
-            content_type = rec_resp.headers.get("Content-Type", "audio/wav")
-
-        transcript = self._transcribe_with_deepgram(rec_resp.content, content_type=content_type)
-        return self.process_transcript(call_id=call_id, transcript=transcript, prompt_question=prompt_to_use)
