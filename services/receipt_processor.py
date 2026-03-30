@@ -8,6 +8,7 @@ Record processing pipeline:
 import requests
 import json
 from datetime import datetime
+import uuid
 from typing import Dict, Any, List
 
 from services.supabase_client import SupabaseClient
@@ -215,6 +216,27 @@ class RecordProcessor:
                         },
                     },
                 },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "format_response_as_image",
+                        "description": "Render the final answer as an image and return a Supabase URL. Use this for tables, checklists, or when the user explicitly asks for an image/visual.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "image_prompt": {
+                                    "type": "string",
+                                    "description": "A concise prompt describing the image content/layout (what to show), not the WhatsApp message caption.",
+                                },
+                                "caption": {
+                                    "type": "string",
+                                    "description": "Short WhatsApp caption to accompany the image (<= 1000 chars).",
+                                },
+                            },
+                            "required": ["image_prompt"],
+                        },
+                    },
+                },
             ]
 
             def tool_executor(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -254,10 +276,26 @@ class RecordProcessor:
                                 "record_type": r.get("record_type"),
                                 "created_at": r.get("created_at"),
                                 "text": ((r.get("ocr_text") or r.get("user_text") or "")[:1500]),
+                                "asset_urls": r.get("storage_urls", []),
                             }
                         )
                     print(f"[RecordProcessor] get_recent_records: {len(out)} record(s)")
                     return {"records": out}
+
+                if name == "format_response_as_image":
+                    image_prompt = str(args.get("image_prompt") or "").strip()
+                    caption = str(args.get("caption") or "").strip()
+                    if not image_prompt:
+                        return {"error": "image_prompt_missing"}
+                    # Generate an image and upload it to Supabase to obtain a URL.
+                    image_bytes = self.openai.generate_image(image_prompt)
+                    file_name = f"wbot_image_{uuid.uuid4().hex}.png"
+                    image_url = self.supabase.upload_file(
+                        file_content=image_bytes,
+                        file_name=file_name,
+                        content_type="image/png",
+                    )
+                    return {"image_url": image_url, "caption": caption}
 
                 return {"error": f"unknown_tool:{name}"}
 
@@ -279,6 +317,11 @@ class RecordProcessor:
                 "Use tools and conversation context when needed to answer.\n"
                 "Answer concisely.\n"
                 "If the answer is not in the records, say you don't know and ask what to save.\n"
+                "If you decide the response should be an image, call `format_response_as_image`.\n"
+                "Then your final message MUST be STRICT JSON with this shape:\n"
+                '{"type":"image","caption":"...","image_url":"...","text":"..."}\n'
+                "Use the tool output for `image_url` and `caption`.\n"
+                "If you do NOT call the image tool, return plain text (no JSON).\n"
                 "Do not mention embeddings, vectors, Supabase, or internal tooling."
             )
 
@@ -293,6 +336,30 @@ class RecordProcessor:
             )
 
             print("[RecordProcessor] answer_question complete")
-            return {"success": True, "answer": answer}
+            final = (answer or "").strip()
+            # Models sometimes wrap JSON in markdown fences.
+            if final.startswith("```"):
+                cleaned = final.strip("`").strip()
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:].strip()
+                final = cleaned
+
+            # If the model returned an image payload, pass it up to the WhatsApp sender.
+            try:
+                parsed = json.loads(final)
+                if isinstance(parsed, dict) and parsed.get("type") == "image" and parsed.get("image_url"):
+                    return {
+                        "success": True,
+                        "answer": {
+                            "type": "image",
+                            "caption": str(parsed.get("caption") or "").strip(),
+                            "image_url": str(parsed.get("image_url") or "").strip(),
+                            "text": str(parsed.get("text") or "").strip(),
+                        },
+                    }
+            except Exception:
+                pass
+
+            return {"success": True, "answer": final}
         except Exception as e:
             return {"success": False, "error": f"Failed to answer: {str(e)}"}

@@ -140,12 +140,38 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
         if not to_number.lower().startswith("whatsapp:"):
             to_number = f"whatsapp:{to_number}" if to_number.startswith("+") else f"whatsapp:+{to_number}"
 
+        media_url = None
+        if isinstance(response_text, dict):
+            if response_text.get("type") == "image" and response_text.get("image_url"):
+                media_url = response_text.get("image_url")
+                body_text = response_text.get("caption") or response_text.get("text") or ""
+                db_content = body_text
+            else:
+                body_text = str(response_text)
+                db_content = body_text
+        else:
+            body_text = response_text
+            db_content = response_text
+
         print(f"[tasks.py] Sending WhatsApp reply to {to_number} from {twilio_from}")
-        twilio_client.messages.create(
-            from_=twilio_from,
-            to=to_number,
-            body=response_text,
-        )
+        if media_url:
+            try:
+                # Twilio fetch can happen after the original signed URL expires.
+                media_url = supabase.resign_url(str(media_url))
+            except Exception as e:
+                print(f"[tasks.py] Warning: failed to re-sign media_url: {e}")
+            twilio_client.messages.create(
+                from_=twilio_from,
+                to=to_number,
+                body=body_text,
+                media_url=[media_url],
+            )
+        else:
+            twilio_client.messages.create(
+                from_=twilio_from,
+                to=to_number,
+                body=body_text,
+            )
 
         ## Save the response to the database
         supabase.save_message(
@@ -154,7 +180,7 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
                 "direction": "out",
                 "role": "assistant",
                 "message_sid": message_sid,
-                "content": response_text,
+                "content": db_content,
             }
         )
 

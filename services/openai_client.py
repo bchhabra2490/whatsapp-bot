@@ -3,6 +3,7 @@ OpenAI client using the official `openai` package for embeddings, chat (with too
 """
 
 import io
+import base64
 import json
 import os
 from typing import Any, Dict, Iterable, List, Optional
@@ -49,6 +50,30 @@ class OpenAIClient:
         emb = resp.data[0].embedding
         print("[OpenAIClient] create_embedding: success")
         return emb
+
+    def generate_image(self, prompt: str, size: str = "1024x1024") -> bytes:
+        """
+        Generate a PNG image from text using OpenAI Images.
+
+        Returns:
+            PNG bytes.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("prompt is required to generate image")
+
+        # Keep model configurable in case you want to switch later.
+        image_model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+        resp = self.client.images.generate(
+            model=image_model,
+            prompt=prompt,
+            size=size,
+            response_format="b64_json",
+        )
+        b64 = (resp.data[0].b64_json or "").strip()
+        if not b64:
+            raise RuntimeError("OpenAI image generation returned empty image data")
+        return base64.b64decode(b64)
 
     def chat(self, system: str, user: str, temperature: float = 0.2, max_tokens: int = 600) -> str:
         msg = self._chat_raw(

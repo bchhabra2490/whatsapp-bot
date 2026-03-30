@@ -6,6 +6,9 @@ import os
 from supabase import create_client, Client
 from typing import Optional, Dict, Any
 import uuid
+import requests
+from urllib.parse import urlparse, unquote
+import time
 
 
 class SupabaseClient:
@@ -50,15 +53,61 @@ class SupabaseClient:
         except Exception as e:
             raise Exception(f"Failed to upload file to Supabase Storage: {str(e)}")
 
-        # Generate a time-limited signed URL for external OCR access
+        def _looks_like_invalid_jwt(resp_text: str) -> bool:
+            t = (resp_text or "").lower()
+            return "invalidjwt" in t and ("exp" in t or "timestamp" in t)
+
+        def _validate_url(url: str) -> bool:
+            """
+            Best-effort fetch to ensure Supabase signed URL isn't immediately invalid/expired.
+            Uses Range to avoid downloading full content.
+            """
+            if not url or not isinstance(url, str):
+                return False
+            headers = {"Range": "bytes=0-1"}
+            try:
+                r = requests.get(url, headers=headers, timeout=5)
+                # Supabase storage returns 200 (or 206 for range) for valid links.
+                if r.status_code in (200, 206):
+                    return True
+                # If it's an invalid/expired token, Supabase returns a 400/401 with body mentioning InvalidJWT.
+                if _looks_like_invalid_jwt(r.text):
+                    return False
+                return r.status_code < 400
+            except Exception:
+                return False
+
+        # Generate a time-limited signed URL for external access
         try:
+            expires_in_seconds = int(
+                os.getenv("SUPABASE_SIGNED_URL_EXPIRES_IN_SECONDS", str(60 * 60 * 24))
+            )  # default 24 hours
             signed = self.client.storage.from_(self.storage_bucket).create_signed_url(
-                storage_path, expires_in=60 * 60  # 1 hour
+                storage_path, expires_in=expires_in_seconds
             )
             # supabase-py returns a dict with 'signedURL' or 'signed_url' depending on version
             url = signed.get("signed_url") or signed.get("signedURL") or signed
+
+            # Some environments interpret `expires_in` in milliseconds.
+            # If the returned URL fails immediately (InvalidJWT), retry once with ms-style.
+            if not _validate_url(url):
+                ms_expires_in = expires_in_seconds * 1000
+                print(
+                    f"[SupabaseClient] upload_file: signed url validation failed; retrying with ms expires_in={ms_expires_in}"
+                )
+                signed_retry = self.client.storage.from_(self.storage_bucket).create_signed_url(
+                    storage_path, expires_in=ms_expires_in
+                )
+                url_retry = (
+                    signed_retry.get("signed_url") or signed_retry.get("signedURL") or signed_retry
+                    if isinstance(signed_retry, dict)
+                    else signed_retry
+                )
+                print(f"[SupabaseClient] upload_file: signed_url_retry={url_retry}")
+                return str(url_retry)
+
             print(f"[SupabaseClient] upload_file: signed_url={url}")
-            return url
+            return str(url)
         except Exception as e:
             raise Exception(f"Failed to create signed URL from Supabase Storage: {str(e)}")
 
@@ -209,3 +258,46 @@ class SupabaseClient:
             return result.data[0] if result.data else {}
         except Exception as e:
             raise Exception(f"Failed to update job: {str(e)}")
+
+    def resign_url(self, url: str, expires_in_seconds: Optional[int] = None) -> str:
+        """
+        Given a previously-signed Supabase Storage URL, drop the querystring and
+        create a fresh signed URL for the same object.
+        """
+        if not url:
+            return url
+        if not isinstance(url, str):
+            return str(url)
+
+        # Per your request: split at '?' and ignore the existing token.
+        base = url.split("?", 1)[0].strip()
+        parsed = urlparse(base)
+        parts = [p for p in parsed.path.split("/") if p]
+
+        # Expected: /storage/v1/object/<sign|public>/<bucket>/<object_path...>
+        try:
+            object_idx = parts.index("object")
+        except ValueError:
+            return url
+
+        if len(parts) < object_idx + 4:
+            return url
+
+        bucket = parts[object_idx + 2]
+        object_path_parts = parts[object_idx + 3 :]
+        object_path = "/".join(unquote(p) for p in object_path_parts).strip("/")
+        if not object_path:
+            return url
+
+        if expires_in_seconds is None:
+            expires_in_seconds = int(os.getenv("SUPABASE_SIGNED_URL_EXPIRES_IN_SECONDS", str(60 * 60 * 24)))
+
+        try:
+            signed = self.client.storage.from_(bucket).create_signed_url(
+                object_path, expires_in=expires_in_seconds
+            )
+            new_url = signed.get("signed_url") or signed.get("signedURL") or signed
+            return str(new_url)
+        except Exception:
+            # If resigning fails for any reason, return the original URL.
+            return url

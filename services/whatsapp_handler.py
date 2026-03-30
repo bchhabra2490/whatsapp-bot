@@ -2,7 +2,7 @@
 WhatsApp message handler
 """
 
-from typing import List
+from typing import Any, Dict, List
 
 from services.receipt_processor import RecordProcessor
 from services.call_service import CallService
@@ -44,7 +44,7 @@ class WhatsAppHandler:
         error = result.get("error", "Unknown error")
         return f"❌ Failed to process media: {error}"
 
-    def handle_text(self, message: str, from_number: str, message_sid: str = "") -> str:
+    def handle_text(self, message: str, from_number: str, message_sid: str = "") -> str | Dict[str, Any]:
         """
         Handle text messages (queries)
 
