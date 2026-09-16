@@ -101,6 +101,20 @@ class CallService:
         self._save_state(call_id, state)
         return state
 
+    def persist_call_end(self, call_id: str, history: Optional[list] = None) -> Dict[str, Any]:
+        """Write hangup + transcript to Redis. Does not call OpenAI or Twilio."""
+        updates: Dict[str, Any] = {"hangup": True}
+        if history:
+            updates["history"] = history
+        state = self.get_call_context(call_id) or {}
+        if not (state.get("final_summary") or "").strip():
+            reason = (state.get("hangup_reason") or "").strip()
+            if reason == "idle_timeout":
+                updates["final_summary"] = "The callee did not respond after a follow-up prompt, so the call ended."
+            elif reason == "max_duration":
+                updates["final_summary"] = "The call reached the maximum duration and was ended."
+        return self.update_state(call_id, updates)
+
     @staticmethod
     def _normalize_phone_number(raw: str) -> str:
         digits = re.sub(r"[^\d+]", "", (raw or "").strip())
@@ -199,7 +213,20 @@ class CallService:
         with self._lock:
             return self._pending_calls.get(call_id)
 
-    def send_call_summary_to_whatsapp(self, call_id: str) -> None:
+    def hangup_twilio_call(self, call_sid: str, reason: str = "") -> bool:
+        """Force-complete a Twilio call. Last resort if the Pipecat pipeline does not end."""
+        call_sid = (call_sid or "").strip()
+        if not call_sid:
+            return False
+        try:
+            self.twilio_client.calls(call_sid).update(status="completed")
+            logger.info(f"[CallService] twilio hangup call_sid={call_sid} reason={reason or 'unspecified'}")
+            return True
+        except Exception as e:
+            logger.error(f"[CallService] twilio hangup failed call_sid={call_sid}: {e}", exc_info=True)
+            return False
+
+    def send_call_summary_to_whatsapp(self, call_id: str, *, raise_on_error: bool = False) -> bool:
         """
         Send a call summary to the WhatsApp requester.
         Safe to call more than once; Redis `summary_sent` makes it idempotent.
@@ -207,14 +234,14 @@ class CallService:
         try:
             state = self.get_call_context(call_id) or {}
             if state.get("summary_sent"):
-                return
+                return True
             requested_by = self._normalize_whatsapp_number(state.get("requested_by") or "")
             twilio_from = self._twilio_whatsapp_from()
             if not (requested_by and twilio_from):
                 logger.error(
                     f"[call_summary] missing numbers call_id={call_id} requested_by={requested_by} twilio_from={twilio_from}"
                 )
-                return
+                return False
 
             purpose = (state.get("purpose_of_call") or state.get("purpose") or "").strip()
             existing_summary = (state.get("final_summary") or "").strip()
@@ -250,5 +277,9 @@ class CallService:
             self.twilio_client.messages.create(from_=twilio_from, to=requested_by, body=body)
             self.update_state(call_id, {"summary_sent": True, "final_summary": summary})
             logger.info(f"[call_summary] sent to={requested_by} call_id={call_id}")
+            return True
         except Exception as e:
             logger.error(f"[call_summary] failed call_id={call_id}: {e}", exc_info=True)
+            if raise_on_error:
+                raise
+            return False

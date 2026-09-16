@@ -201,3 +201,23 @@ def process_whatsapp_job(job_id: str) -> Dict[str, Any]:
             # swallow any Twilio error here; main failure is already recorded
             pass
         return {"success": False, "job_id": job_id, "error": str(e)}
+
+
+@celery_app.task(
+    name="summarize_ended_call",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_kwargs={"max_retries": 3},
+)
+def summarize_ended_call(call_id: str) -> Dict[str, Any]:
+    """Post-call OpenAI summary + WhatsApp delivery. Runs off the Pipecat event loop."""
+    load_dotenv()
+    twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not (twilio_account_sid and twilio_auth_token):
+        raise ValueError("Twilio credentials are required to send a call summary")
+    twilio_client = TwilioClient(twilio_account_sid, twilio_auth_token)
+    openai_client = OpenAIClient()
+    call_service = CallService(twilio_client=twilio_client, openai_client=openai_client)
+    call_service.send_call_summary_to_whatsapp(call_id, raise_on_error=True)
+    return {"success": True, "call_id": call_id}
