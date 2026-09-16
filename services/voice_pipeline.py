@@ -223,9 +223,7 @@ async def run_voice_pipeline(
     vad_start_secs = float(os.getenv("VOICE_VAD_START_SECS") or "0.15")
     idle_timeout_secs = float(os.getenv("VOICE_IDLE_TIMEOUT_SECS") or DEFAULT_IDLE_TIMEOUT_SECS)
     max_duration_secs = float(os.getenv("VOICE_MAX_DURATION_SECS") or DEFAULT_MAX_DURATION_SECS)
-    force_hangup_grace_secs = float(
-        os.getenv("VOICE_FORCE_HANGUP_GRACE_SECS") or DEFAULT_FORCE_HANGUP_GRACE_SECS
-    )
+    force_hangup_grace_secs = float(os.getenv("VOICE_FORCE_HANGUP_GRACE_SECS") or DEFAULT_FORCE_HANGUP_GRACE_SECS)
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
@@ -284,9 +282,7 @@ async def run_voice_pipeline(
     async def _force_twilio_hangup(reason: str) -> None:
         if lifecycle["finished"]:
             return
-        logger.warning(
-            f"[voice] force twilio hangup call_id={call_id} call_sid={twilio_call_sid} reason={reason}"
-        )
+        logger.warning(f"[voice] force twilio hangup call_id={call_id} call_sid={twilio_call_sid} reason={reason}")
         await asyncio.to_thread(call_service.hangup_twilio_call, twilio_call_sid, reason)
 
     async def _graceful_end(reason: str, spoken: str) -> None:
@@ -338,8 +334,6 @@ async def run_voice_pipeline(
         try:
             await asyncio.sleep(max_duration_secs)
             await _graceful_end("max_duration", MAX_DURATION_GOODBYE)
-            await asyncio.sleep(force_hangup_grace_secs)
-            await _force_twilio_hangup("max_duration")
         except asyncio.CancelledError:
             return
 
