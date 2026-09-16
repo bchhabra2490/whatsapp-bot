@@ -1,0 +1,6 @@
+/Users/b-eq/Desktop/projects/whatsapp-bot/.agents/skills/text-to-speech/SKILL.md
+/Users/b-eq/Desktop/projects/whatsapp-bot/.agents/skills/text-to-speech/references/installation.md
+/Users/b-eq/Desktop/projects/whatsapp-bot/.agents/skills/text-to-speech/references/streaming.md
+/Users/b-eq/Desktop/projects/whatsapp-bot/.agents/skills/text-to-speech/references/voice-settings.md
+/Users/b-eq/Desktop/projects/whatsapp-bot/README.md
+/Users/b-eq/Desktop/projects/whatsapp-bot/requirements.txt
