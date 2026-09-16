@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -18,8 +19,6 @@ from services.voice_pipeline import run_voice_pipeline
 
 load_dotenv()
 
-app = FastAPI(title="WhatsApp Bot Voice Service")
-
 _call_service: Optional[CallService] = None
 
 
@@ -29,6 +28,22 @@ def get_call_service() -> CallService:
         twilio_client = TwilioClient(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
         _call_service = CallService(twilio_client=twilio_client, openai_client=OpenAIClient())
     return _call_service
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        connected = get_call_service().ping_redis()
+        if connected:
+            logger.info("Redis connected")
+        else:
+            logger.error("Redis not connected")
+    except Exception as e:
+        logger.error(f"Redis not connected: {e}")
+    yield
+
+
+app = FastAPI(title="WhatsApp Bot Voice Service", lifespan=lifespan)
 
 
 def _forwarded_host(request_headers) -> str:
@@ -138,7 +153,7 @@ def _mount_flask_if_enabled() -> None:
     if raw in {"0", "false", "no", "off"}:
         return
     try:
-        from fastapi.middleware.wsgi import WSGIMiddleware
+        from a2wsgi import WSGIMiddleware
         from app import app as flask_app
 
         app.mount("/", WSGIMiddleware(flask_app))
@@ -147,6 +162,7 @@ def _mount_flask_if_enabled() -> None:
         logger.exception("Failed to mount Flask app")
 
 
+@app.get("/")
 @app.get("/health")
 async def health_check():
     return JSONResponse({"status": "healthy", "service": "voice"})

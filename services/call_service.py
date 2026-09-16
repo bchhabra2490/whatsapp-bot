@@ -9,7 +9,7 @@ import re
 import uuid
 import json
 import logging
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from threading import Lock
 from typing import Any, Dict, Optional
 
@@ -38,6 +38,27 @@ class CallService:
         ).strip()
         self.call_state_ttl_seconds = int(os.getenv("CALL_STATE_TTL_SECONDS") or "86400")
         self._redis_client: Optional[redis.Redis] = None
+
+    def _redis_target(self) -> str:
+        try:
+            parsed = urlparse(self.redis_url)
+            host = parsed.hostname or "localhost"
+            port = parsed.port or 6379
+            db = (parsed.path or "/0").lstrip("/") or "0"
+            return f"{host}:{port}/{db}"
+        except Exception:
+            return "unknown"
+
+    def ping_redis(self) -> bool:
+        """Ping Redis and log whether the connection works."""
+        target = self._redis_target()
+        try:
+            self._redis().ping()
+            logger.info(f"[CallService] Redis connected at {target}")
+            return True
+        except Exception as e:
+            logger.error(f"[CallService] Redis not connected at {target}: {e}")
+            return False
 
     @property
     def voice_base_url(self) -> str:

@@ -11,4 +11,5 @@ redis>=5.0.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
+a2wsgi>=1.10.0
 pipecat-ai[websocket,silero,deepgram,openai,elevenlabs]~=1.10.0
